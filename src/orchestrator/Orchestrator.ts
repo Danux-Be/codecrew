@@ -1,19 +1,44 @@
+import { isQuotaExhaustedError } from "../clients/anthropicCompat.js";
 import { ClaudeClient } from "../clients/ClaudeClient.js";
 import { GLMClient } from "../clients/GLMClient.js";
+import type { ImplementationPlan, PlanStep } from "../clients/schemas.js";
 import type { FileChange, ProjectContext } from "../clients/types.js";
-import type { PlanStep } from "../clients/schemas.js";
-import { listProjectTree, readFileIfExists, resolveFilesGlob, resolveInRoot, writeFileEnsured } from "../tools/fileSystem.js";
+import {
+  listProjectTree,
+  readFileIfExists,
+  resolveFilesGlob,
+  resolveInRoot,
+  writeFileEnsured,
+} from "../tools/fileSystem.js";
 import { runCommand } from "../tools/terminal.js";
 import { computeFileDiff } from "../utils/diffing.js";
 import { logger } from "../ui/logger.js";
 import type { RunOptions } from "./types.js";
 
+interface StepOutcome {
+  changes: FileChange[];
+  forcedByIterationLimit: boolean;
+  reviewSkipped: boolean;
+}
+
 /**
  * Orchestrateur principal : fait collaborer Claude (plan + relecture) et GLM
  * (implémentation) étape par étape, avec une boucle de correction bornée
  * avant application des modifications sur le disque.
+ *
+ * Résilience : si l'un des deux agents tombe à court de crédit/quota en
+ * cours de route, l'orchestrateur bascule automatiquement sur l'autre pour
+ * le rôle concerné plutôt que d'interrompre tout le run :
+ * - GLM indisponible -> Claude implémente lui-même l'étape (relecture inchangée)
+ * - Claude indisponible -> GLM génère le plan et implémente, mais la
+ *   relecture indépendante est désactivée pour le reste du run (GLM ne
+ *   relit jamais son propre travail : ce ne serait pas une vraie relecture).
+ * Si les deux agents sont indisponibles, l'erreur est propagée normalement.
  */
 export class Orchestrator {
+  private claudeAvailable = true;
+  private glmAvailable = true;
+
   constructor(
     private readonly claude: ClaudeClient,
     private readonly glm: GLMClient,
@@ -22,9 +47,7 @@ export class Orchestrator {
   async run(options: RunOptions): Promise<void> {
     const context = await this.buildContext(options);
 
-    let planSpinner = logger.spinner("claude", "Analyse du projet et génération du plan d'implémentation...");
-    const plan = await this.claude.createPlan(options.task, context);
-    planSpinner.succeed("Plan généré.");
+    const plan = await this.generatePlan(options.task, context);
 
     logger.title("Plan d'implémentation");
     logger.info(plan.summary);
@@ -39,27 +62,29 @@ export class Orchestrator {
 
     let totalApplied = 0;
     let totalForced = 0;
+    let totalUnreviewed = 0;
 
     for (const step of plan.steps) {
       logger.title(`Étape ${step.id}/${plan.steps.length} — ${step.description}`);
 
       const baseline = await this.readBaseline(options.root, step.files);
-      const { changes, forced } = await this.implementStepWithReview(step, baseline, options);
+      const outcome = await this.implementStepWithReview(step, baseline, options);
 
       if (!options.dryRun) {
-        for (const change of changes) {
+        for (const change of outcome.changes) {
           const abs = resolveInRoot(options.root, change.path);
           await writeFileEnsured(abs, change.content);
         }
       }
 
-      totalApplied += changes.length;
-      if (forced) totalForced += 1;
+      totalApplied += outcome.changes.length;
+      if (outcome.forcedByIterationLimit) totalForced += 1;
+      if (outcome.reviewSkipped) totalUnreviewed += 1;
 
       logger.success(
         options.dryRun
-          ? `Étape ${step.id} : ${changes.length} fichier(s) proposé(s) (mode dry-run, rien écrit sur disque).`
-          : `Étape ${step.id} : ${changes.length} fichier(s) appliqué(s).`,
+          ? `Étape ${step.id} : ${outcome.changes.length} fichier(s) proposé(s) (mode dry-run, rien écrit sur disque).`
+          : `Étape ${step.id} : ${outcome.changes.length} fichier(s) appliqué(s).`,
       );
     }
 
@@ -68,31 +93,75 @@ export class Orchestrator {
     }
 
     logger.title("Résumé");
+    const notes: string[] = [];
+    if (totalForced > 0) notes.push(`${totalForced} étape(s) appliquée(s) malgré des réserves (limite d'itérations atteinte)`);
+    if (totalUnreviewed > 0) notes.push(`${totalUnreviewed} étape(s) appliquée(s) sans relecture indépendante (Claude indisponible)`);
     logger.success(
       `${plan.steps.length} étape(s) traitée(s), ${totalApplied} fichier(s) touché(s)` +
-        (totalForced > 0 ? `, dont ${totalForced} appliqué(s) malgré des réserves de Claude (limite d'itérations atteinte).` : "."),
+        (notes.length > 0 ? `, dont ${notes.join(", ")}.` : "."),
     );
   }
 
   /**
-   * Boucle GLM (implémentation) -> Claude (relecture) pour une étape donnée,
-   * avec un nombre maximal d'itérations en cas de demande de changements.
+   * Génère le plan via Claude ; si Claude est indisponible (crédits
+   * épuisés), bascule sur GLM. Si les deux échouent pour la même raison,
+   * l'erreur est propagée.
+   */
+  private async generatePlan(task: string, context: ProjectContext): Promise<ImplementationPlan> {
+    if (this.claudeAvailable) {
+      const spinner = logger.spinner("claude", "Analyse du projet et génération du plan d'implémentation...");
+      try {
+        const plan = await this.claude.createPlan(task, context);
+        spinner.succeed("Plan généré par Claude.");
+        return plan;
+      } catch (err) {
+        if (!isQuotaExhaustedError(err)) {
+          spinner.fail("Échec de la génération du plan.");
+          throw err;
+        }
+        this.claudeAvailable = false;
+        spinner.warn("Claude indisponible (crédits/quota épuisés) — bascule sur GLM pour le plan et la suite du run.");
+        logger.warn("Aucune relecture indépendante ne sera possible tant que Claude reste indisponible.");
+      }
+    }
+
+    if (this.glmAvailable) {
+      const spinner = logger.spinner("glm", "Génération du plan d'implémentation (Claude indisponible)...");
+      try {
+        const plan = await this.glm.createPlan(task, context);
+        spinner.succeed("Plan généré par GLM.");
+        return plan;
+      } catch (err) {
+        if (!isQuotaExhaustedError(err)) {
+          spinner.fail("Échec de la génération du plan.");
+          throw err;
+        }
+        this.glmAvailable = false;
+        spinner.fail("GLM également indisponible (crédits/quota épuisés).");
+      }
+    }
+
+    throw new Error(
+      "Impossible de générer un plan : Claude et GLM sont tous les deux indisponibles (crédits/quota épuisés).",
+    );
+  }
+
+  /**
+   * Boucle implémentation -> relecture pour une étape donnée, avec repli
+   * automatique entre agents et un nombre maximal d'itérations en cas de
+   * demande de changements.
    */
   private async implementStepWithReview(
     step: PlanStep,
     baseline: Map<string, string | null>,
     options: RunOptions,
-  ): Promise<{ changes: FileChange[]; forced: boolean }> {
+  ): Promise<StepOutcome> {
     let feedback: string | undefined;
     let lastChanges: FileChange[] = [];
 
     for (let iteration = 1; iteration <= options.maxIterations; iteration++) {
-      const label = iteration === 1 ? "Implémentation..." : `Implémentation (correction ${iteration - 1})...`;
-      const glmSpinner = logger.spinner("glm", label);
-
       const currentFiles = step.files.map((path) => ({ path, content: baseline.get(path) ?? null }));
-      const changes = await this.glm.implementStep(step, currentFiles, feedback);
-      glmSpinner.succeed("Code généré.");
+      const changes = await this.implementStep(step, currentFiles, feedback, iteration);
       lastChanges = changes;
 
       const diffs = changes.map((c) => computeFileDiff(c.path, baseline.get(c.path) ?? null, c.content));
@@ -101,12 +170,29 @@ export class Orchestrator {
         logger.diff(diff.unified);
       }
 
+      if (!this.claudeAvailable) {
+        logger.warn("Étape appliquée sans relecture indépendante (Claude indisponible).");
+        return { changes, forcedByIterationLimit: false, reviewSkipped: true };
+      }
+
       const reviewSpinner = logger.spinner("claude", "Relecture du code...");
-      const review = await this.claude.reviewChanges(step.description, step.instructions, diffs);
+      let review;
+      try {
+        review = await this.claude.reviewChanges(step.description, step.instructions, diffs);
+      } catch (err) {
+        if (!isQuotaExhaustedError(err)) {
+          reviewSpinner.fail("Échec de la relecture.");
+          throw err;
+        }
+        this.claudeAvailable = false;
+        reviewSpinner.warn("Claude devenu indisponible (crédits/quota épuisés) pendant la relecture.");
+        logger.warn("Étape appliquée sans relecture indépendante (Claude indisponible).");
+        return { changes, forcedByIterationLimit: false, reviewSkipped: true };
+      }
 
       if (review.verdict === "approve") {
         reviewSpinner.succeed(`Approuvé — ${review.summary}`);
-        return { changes, forced: false };
+        return { changes, forcedByIterationLimit: false, reviewSkipped: false };
       }
 
       reviewSpinner.warn(`Changements demandés — ${review.summary}`);
@@ -119,14 +205,64 @@ export class Orchestrator {
           `Nombre maximal d'itérations (${options.maxIterations}) atteint pour cette étape : ` +
             "application des dernières modifications malgré les réserves ci-dessus.",
         );
-        return { changes: lastChanges, forced: true };
+        return { changes: lastChanges, forcedByIterationLimit: true, reviewSkipped: false };
       }
 
       feedback = [review.summary, ...review.issues.map((i) => `- [${i.file}] ${i.comment}`)].join("\n");
     }
 
     // Inatteignable si maxIterations >= 1, gardé pour la sûreté du typage.
-    return { changes: lastChanges, forced: true };
+    return { changes: lastChanges, forcedByIterationLimit: true, reviewSkipped: false };
+  }
+
+  /**
+   * Implémente une étape via GLM ; si GLM est indisponible (crédits
+   * épuisés), bascule sur Claude. Si les deux échouent pour la même
+   * raison, l'erreur est propagée.
+   */
+  private async implementStep(
+    step: PlanStep,
+    currentFiles: Array<{ path: string; content: string | null }>,
+    feedback: string | undefined,
+    iteration: number,
+  ): Promise<FileChange[]> {
+    const label = iteration === 1 ? "Implémentation..." : `Implémentation (correction ${iteration - 1})...`;
+
+    if (this.glmAvailable) {
+      const spinner = logger.spinner("glm", label);
+      try {
+        const changes = await this.glm.implementStep(step, currentFiles, feedback);
+        spinner.succeed("Code généré par GLM.");
+        return changes;
+      } catch (err) {
+        if (!isQuotaExhaustedError(err)) {
+          spinner.fail("Échec de l'implémentation.");
+          throw err;
+        }
+        this.glmAvailable = false;
+        spinner.warn("GLM indisponible (crédits/quota épuisés) — Claude implémente directement cette étape.");
+      }
+    }
+
+    if (this.claudeAvailable) {
+      const spinner = logger.spinner("claude", `${label} (GLM indisponible)`);
+      try {
+        const changes = await this.claude.implementStep(step, currentFiles, feedback);
+        spinner.succeed("Code généré par Claude.");
+        return changes;
+      } catch (err) {
+        if (!isQuotaExhaustedError(err)) {
+          spinner.fail("Échec de l'implémentation.");
+          throw err;
+        }
+        this.claudeAvailable = false;
+        spinner.fail("Claude également indisponible (crédits/quota épuisés).");
+      }
+    }
+
+    throw new Error(
+      "Impossible d'implémenter cette étape : Claude et GLM sont tous les deux indisponibles (crédits/quota épuisés).",
+    );
   }
 
   private async readBaseline(root: string, files: string[]): Promise<Map<string, string | null>> {

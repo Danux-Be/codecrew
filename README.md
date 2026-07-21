@@ -105,6 +105,16 @@ Tâche utilisateur
 5. Exécution optionnelle des tests (--test)
 ```
 
+## Résilience (repli automatique)
+
+Claude et GLM parlent le même protocole (Anthropic Messages API), donc chacun peut au besoin remplir le rôle de l'autre. Si l'un des deux tombe à court de crédit/quota en cours de route, `codecrew` bascule automatiquement plutôt que d'interrompre le run :
+
+- **GLM indisponible** → Claude implémente lui-même l'étape ; la relecture continue normalement (qualité inchangée, juste plus lent/coûteux côté Claude).
+- **Claude indisponible** → GLM génère le plan et implémente, mais **la relecture indépendante est désactivée** pour le reste du run — `codecrew` te le signale clairement plutôt que de simuler une auto-relecture par le même modèle (qui n'aurait aucune valeur).
+- **Les deux indisponibles** → échec explicite, rien d'autre à faire.
+
+La détection se base sur les erreurs HTTP 429 et les messages mentionnant explicitement un crédit/solde/quota insuffisant — un vrai rate-limit transitoire peut donc aussi déclencher un repli (compromis assumé : mieux vaut basculer à tort que planter tout le pipeline).
+
 ## Sécurité
 
 - Toute écriture de fichier est confinée à la racine du projet (`--root`) : aucun chemin ne peut s'en échapper (`..`, chemins absolus).

@@ -1,4 +1,4 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 
 /**
  * Extrait le premier bloc de texte d'une réponse Anthropic (ou compatible
@@ -15,4 +15,26 @@ export function extractFirstText(message: Anthropic.Message): string {
     throw new Error("Le modèle n'a retourné aucun contenu textuel exploitable.");
   }
   return textBlock.text;
+}
+
+const QUOTA_KEYWORDS = /credit|balance|quota|insufficient|resource package|recharge|too low/i;
+
+/**
+ * Détecte si une erreur reflète un solde/quota épuisé côté fournisseur
+ * (plutôt qu'une erreur de requête, d'auth ou réseau), pour déclencher le
+ * repli automatique sur l'autre agent (Claude <-> GLM). Heuristique :
+ * - HTTP 429 (rate limit / solde insuffisant, observé chez Anthropic et GLM/Z.ai)
+ * - HTTP 400 dont le message mentionne explicitement crédit/solde/quota
+ * - tout message d'erreur (y compris ré-encapsulé) contenant ces mots-clés
+ * Ce n'est pas infaillible (un vrai rate-limit transitoire déclenchera aussi
+ * le repli), mais c'est un compromis raisonnable : mieux vaut basculer sur
+ * l'autre agent à tort que planter tout le pipeline.
+ */
+export function isQuotaExhaustedError(err: unknown): boolean {
+  if (err instanceof Anthropic.APIError) {
+    if (err.status === 429) return true;
+    if (err.status === 400 && QUOTA_KEYWORDS.test(err.message)) return true;
+  }
+  if (err instanceof Error && QUOTA_KEYWORDS.test(err.message)) return true;
+  return false;
 }
