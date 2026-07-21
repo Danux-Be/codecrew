@@ -1,0 +1,18 @@
+import type { Effort } from "../clients/ClaudeClient.js";
+
+export interface RunOptions {
+  /** Description de la tâche à réaliser, fournie par l'utilisateur. */
+  task: string;
+  /** Répertoire racine du projet (par défaut : cwd). */
+  root: string;
+  /** Glob optionnel pour cibler explicitement des fichiers existants comme contexte. */
+  filesGlob?: string;
+  /** Niveau d'effort pour Claude (plan + review). */
+  effort?: Effort;
+  /** Nombre max d'allers-retours GLM -> Claude par étape en cas de demande de changements. */
+  maxIterations: number;
+  /** Commande de test à exécuter après chaque étape validée (ex: "npm test"). */
+  testCommand?: string;
+  /** Si vrai, n'écrit rien sur disque : affiche seulement le plan et les diffs proposés. */
+  dryRun: boolean;
+}
