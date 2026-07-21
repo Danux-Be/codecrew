@@ -1,6 +1,7 @@
 import { isQuotaExhaustedError } from "../clients/anthropicCompat.js";
 import { ClaudeClient } from "../clients/ClaudeClient.js";
 import { GLMClient } from "../clients/GLMClient.js";
+import type { OllamaClient } from "../clients/OllamaClient.js";
 import type { ImplementationPlan, PlanStep } from "../clients/schemas.js";
 import type { FileChange, ProjectContext } from "../clients/types.js";
 import {
@@ -19,7 +20,10 @@ interface StepOutcome {
   changes: FileChange[];
   forcedByIterationLimit: boolean;
   reviewSkipped: boolean;
+  localUsed: boolean;
 }
+
+type ImplementAgent = "local" | "glm" | "claude";
 
 /**
  * Orchestrateur principal : fait collaborer Claude (plan + relecture) et GLM
@@ -34,15 +38,25 @@ interface StepOutcome {
  *   relecture indépendante est désactivée pour le reste du run (GLM ne
  *   relit jamais son propre travail : ce ne serait pas une vraie relecture).
  * Si les deux agents sont indisponibles, l'erreur est propagée normalement.
+ *
+ * 3ème agent optionnel (Ollama, local) : utilisé de façon opportuniste pour
+ * les étapes marquées 'trivial' par l'architecte, afin d'économiser des
+ * tokens Claude/GLM sur les tâches purement mécaniques. Toute panne locale
+ * (modèle non installé, service arrêté, réponse invalide) déclenche un
+ * repli silencieux sur GLM (puis Claude) — jamais un échec du run.
  */
 export class Orchestrator {
   private claudeAvailable = true;
   private glmAvailable = true;
+  private ollamaAvailable: boolean;
 
   constructor(
     private readonly claude: ClaudeClient,
     private readonly glm: GLMClient,
-  ) {}
+    private readonly ollama?: OllamaClient,
+  ) {
+    this.ollamaAvailable = Boolean(ollama);
+  }
 
   async run(options: RunOptions): Promise<void> {
     const context = await this.buildContext(options);
@@ -63,6 +77,7 @@ export class Orchestrator {
     let totalApplied = 0;
     let totalForced = 0;
     let totalUnreviewed = 0;
+    let totalLocal = 0;
 
     for (const step of plan.steps) {
       logger.title(`Étape ${step.id}/${plan.steps.length} — ${step.description}`);
@@ -80,6 +95,7 @@ export class Orchestrator {
       totalApplied += outcome.changes.length;
       if (outcome.forcedByIterationLimit) totalForced += 1;
       if (outcome.reviewSkipped) totalUnreviewed += 1;
+      if (outcome.localUsed) totalLocal += 1;
 
       logger.success(
         options.dryRun
@@ -96,6 +112,7 @@ export class Orchestrator {
     const notes: string[] = [];
     if (totalForced > 0) notes.push(`${totalForced} étape(s) appliquée(s) malgré des réserves (limite d'itérations atteinte)`);
     if (totalUnreviewed > 0) notes.push(`${totalUnreviewed} étape(s) appliquée(s) sans relecture indépendante (Claude indisponible)`);
+    if (totalLocal > 0) notes.push(`${totalLocal} étape(s) implémentée(s) localement (Ollama)`);
     logger.success(
       `${plan.steps.length} étape(s) traitée(s), ${totalApplied} fichier(s) touché(s)` +
         (notes.length > 0 ? `, dont ${notes.join(", ")}.` : "."),
@@ -158,11 +175,13 @@ export class Orchestrator {
   ): Promise<StepOutcome> {
     let feedback: string | undefined;
     let lastChanges: FileChange[] = [];
+    let localUsed = false;
 
     for (let iteration = 1; iteration <= options.maxIterations; iteration++) {
       const currentFiles = step.files.map((path) => ({ path, content: baseline.get(path) ?? null }));
-      const changes = await this.implementStep(step, currentFiles, feedback, iteration);
+      const { changes, agent } = await this.implementStep(step, currentFiles, feedback, iteration);
       lastChanges = changes;
+      if (agent === "local") localUsed = true;
 
       const diffs = changes.map((c) => computeFileDiff(c.path, baseline.get(c.path) ?? null, c.content));
       for (const diff of diffs) {
@@ -172,7 +191,7 @@ export class Orchestrator {
 
       if (!this.claudeAvailable) {
         logger.warn("Étape appliquée sans relecture indépendante (Claude indisponible).");
-        return { changes, forcedByIterationLimit: false, reviewSkipped: true };
+        return { changes, forcedByIterationLimit: false, reviewSkipped: true, localUsed };
       }
 
       const reviewSpinner = logger.spinner("claude", "Relecture du code...");
@@ -187,12 +206,12 @@ export class Orchestrator {
         this.claudeAvailable = false;
         reviewSpinner.warn("Claude devenu indisponible (crédits/quota épuisés) pendant la relecture.");
         logger.warn("Étape appliquée sans relecture indépendante (Claude indisponible).");
-        return { changes, forcedByIterationLimit: false, reviewSkipped: true };
+        return { changes, forcedByIterationLimit: false, reviewSkipped: true, localUsed };
       }
 
       if (review.verdict === "approve") {
         reviewSpinner.succeed(`Approuvé — ${review.summary}`);
-        return { changes, forcedByIterationLimit: false, reviewSkipped: false };
+        return { changes, forcedByIterationLimit: false, reviewSkipped: false, localUsed };
       }
 
       reviewSpinner.warn(`Changements demandés — ${review.summary}`);
@@ -205,35 +224,52 @@ export class Orchestrator {
           `Nombre maximal d'itérations (${options.maxIterations}) atteint pour cette étape : ` +
             "application des dernières modifications malgré les réserves ci-dessus.",
         );
-        return { changes: lastChanges, forcedByIterationLimit: true, reviewSkipped: false };
+        return { changes: lastChanges, forcedByIterationLimit: true, reviewSkipped: false, localUsed };
       }
 
       feedback = [review.summary, ...review.issues.map((i) => `- [${i.file}] ${i.comment}`)].join("\n");
     }
 
     // Inatteignable si maxIterations >= 1, gardé pour la sûreté du typage.
-    return { changes: lastChanges, forcedByIterationLimit: true, reviewSkipped: false };
+    return { changes: lastChanges, forcedByIterationLimit: true, reviewSkipped: false, localUsed };
   }
 
   /**
-   * Implémente une étape via GLM ; si GLM est indisponible (crédits
-   * épuisés), bascule sur Claude. Si les deux échouent pour la même
-   * raison, l'erreur est propagée.
+   * Implémente une étape. Ordre de préférence :
+   * 1. Ollama (agent local), uniquement si l'étape est marquée 'trivial'
+   *    par l'architecte — toute panne locale déclenche un repli silencieux
+   *    sur GLM, sans marquer GLM indisponible.
+   * 2. GLM (rôle nominal) ; si indisponible (crédits/quota épuisés),
+   *    bascule sur Claude.
+   * Si Claude et GLM échouent tous deux pour la même raison, l'erreur est
+   * propagée.
    */
   private async implementStep(
     step: PlanStep,
     currentFiles: Array<{ path: string; content: string | null }>,
     feedback: string | undefined,
     iteration: number,
-  ): Promise<FileChange[]> {
+  ): Promise<{ changes: FileChange[]; agent: ImplementAgent }> {
     const label = iteration === 1 ? "Implémentation..." : `Implémentation (correction ${iteration - 1})...`;
+
+    if (this.ollama && this.ollamaAvailable && step.complexity === "trivial") {
+      const spinner = logger.spinner("local", `${label} (étape triviale)`);
+      try {
+        const changes = await this.ollama.implementStep(step, currentFiles, feedback);
+        spinner.succeed("Code généré localement (Ollama).");
+        return { changes, agent: "local" };
+      } catch (err) {
+        this.ollamaAvailable = false;
+        spinner.warn(`Agent local en échec (${(err as Error).message}) — repli sur GLM pour le reste du run.`);
+      }
+    }
 
     if (this.glmAvailable) {
       const spinner = logger.spinner("glm", label);
       try {
         const changes = await this.glm.implementStep(step, currentFiles, feedback);
         spinner.succeed("Code généré par GLM.");
-        return changes;
+        return { changes, agent: "glm" };
       } catch (err) {
         if (!isQuotaExhaustedError(err)) {
           spinner.fail("Échec de l'implémentation.");
@@ -249,7 +285,7 @@ export class Orchestrator {
       try {
         const changes = await this.claude.implementStep(step, currentFiles, feedback);
         spinner.succeed("Code généré par Claude.");
-        return changes;
+        return { changes, agent: "claude" };
       } catch (err) {
         if (!isQuotaExhaustedError(err)) {
           spinner.fail("Échec de l'implémentation.");

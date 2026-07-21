@@ -1,28 +1,31 @@
 # codecrew
 
-**CLI open-source qui fait collaborer deux IA — Claude et GLM — sur un même projet de code local**, dans la lignée de [Claude Code](https://github.com/anthropics/claude-code), pour maximiser la qualité du développement, du refactoring et du debugging.
+**Open-source CLI that makes two (or three) AIs collaborate — Claude and GLM, plus an optional local model — on the same local codebase**, in the spirit of [Claude Code](https://github.com/anthropics/claude-code), to maximize the quality of development, refactoring, and debugging work.
 
-Claude joue l'**architecte et le reviewer** ; GLM joue l'**implémenteur**. Chacun fait ce qu'il fait le mieux, et l'utilisateur voit les deux IA échanger en temps réel dans son terminal.
+Claude plays the **architect and reviewer**; GLM plays the **implementer**; a local model (Ollama), if detected, opportunistically handles trivial mechanical steps to save Claude/GLM tokens. Each agent does what it's best at, and you watch them collaborate in real time in your terminal.
 
-## Pourquoi codecrew ?
+## Why codecrew?
 
-- **Séparation des responsabilités** : la planification et la relecture (édge cases, typage, robustesse) sont confiées à un modèle orienté raisonnement (Claude) ; l'écriture de code brut à un modèle rapide (GLM).
-- **Boucle de qualité automatique** : chaque étape est relue par Claude avant d'être considérée comme terminée ; en cas de réserve, GLM corrige, dans la limite d'un nombre d'itérations configurable.
-- **Transparence totale** : chaque échange (plan, code généré, diff, verdict de relecture) est affiché dans le terminal avec une identification visuelle claire (Claude en bleu, GLM en vert).
-- **Local et scriptable** : aucune donnée ne transite ailleurs que vers les deux API configurées ; le CLI s'intègre dans n'importe quel projet existant.
+- **Separation of concerns**: planning and review (edge cases, typing, robustness) go to a reasoning-oriented model (Claude); raw code authoring goes to a fast model (GLM).
+- **Automatic quality loop**: every step is reviewed by Claude before being considered done; if there are objections, GLM revises, up to a configurable number of iterations.
+- **Full transparency**: every exchange (plan, generated code, diff, review verdict) is printed to the terminal with clear visual attribution (Claude in blue, GLM in green, the local agent in magenta).
+- **Resilient by design**: if either paid agent runs out of credit/quota mid-run, codecrew automatically falls back to the other rather than crashing (see [Resilience](#resilience-automatic-fallback) below).
+- **Local and scriptable**: no data goes anywhere except the configured APIs; the CLI drops into any existing project.
 
-## Rôles
+## Roles
 
-| Agent | Rôle | Responsabilités |
+| Agent | Role | Responsibilities |
 | --- | --- | --- |
-| **Claude** | Architecte & Reviewer | Analyse le projet, découpe la tâche en plan d'implémentation précis (fichiers ciblés, instructions non ambiguës), puis relit chaque diff produit par GLM et demande des corrections si nécessaire. |
-| **GLM** | Implémenteur | Écrit le contenu complet des fichiers à partir des instructions du plan, et réécrit ce qui est nécessaire suite au feedback de relecture. |
+| **Claude** | Architect & Reviewer | Analyzes the project, breaks the task down into a precise implementation plan (targeted files, unambiguous instructions), then reviews every diff produced by GLM and requests changes if needed. |
+| **GLM** | Implementer | Writes the full content of files from the plan's instructions, and rewrites whatever's needed based on review feedback. |
+| **Ollama (optional, local)** | Cheap implementer for trivial steps | Auto-detected on `localhost:11434`. Handles only the plan steps the architect flagged as `trivial` (boilerplate, simple config files, static text) — never planning or review. Falls back silently to GLM on any failure. |
 
-## Prérequis
+## Prerequisites
 
 - Node.js ≥ 20
-- Une clé API [Anthropic](https://console.anthropic.com/) (Claude), avec du crédit disponible
-- Une clé API GLM exposant un endpoint **compatible protocole Anthropic** — typiquement le [GLM Coding Plan de Z.ai](https://z.ai/manage-apikey/apikey-list) (`https://api.z.ai/api/anthropic`), avec quota/crédit disponible sur ce plan spécifiquement (distinct de tout abonnement chat classique)
+- An [Anthropic](https://console.anthropic.com/) API key (Claude), with available credit
+- A GLM API key exposing an **Anthropic-protocol-compatible** endpoint — typically the [Z.ai GLM Coding Plan](https://z.ai/manage-apikey/apikey-list) (`https://api.z.ai/api/anthropic`), with quota/credit available on that specific plan (distinct from any regular chat subscription)
+- Optional: [Ollama](https://ollama.com/) running locally with at least one model installed, if you want the 3rd local agent
 
 ## Installation
 
@@ -31,7 +34,7 @@ git clone https://github.com/Danux-Be/codecrew.git
 cd codecrew
 npm install
 npm run build
-npm link   # rend la commande `codecrew` disponible globalement
+npm link   # makes the `codecrew` command available globally
 ```
 
 ## Configuration
@@ -40,31 +43,32 @@ npm link   # rend la commande `codecrew` disponible globalement
 codecrew config
 ```
 
-Demande interactivement :
-- la clé API Anthropic (Claude)
-- le modèle Claude à utiliser (par défaut `claude-opus-4-8`)
-- la clé API GLM
-- l'URL de base (par défaut `https://api.z.ai/api/anthropic`) et le modèle GLM (ex: `glm-4.6`, `glm-5.2`)
-- le niveau d'effort par défaut (profondeur de réflexion de Claude) et le nombre max d'itérations de correction par étape
+Interactively asks for:
+- your Anthropic API key (Claude)
+- the Claude model to use (defaults to `claude-opus-4-8`)
+- your GLM API key
+- the base URL (defaults to `https://api.z.ai/api/anthropic`) and GLM model (e.g. `glm-4.6`, `glm-5.2`)
+- the default effort level (Claude's thinking depth) and the max number of correction iterations per step
+- whether to enable the local Ollama agent, its base URL, and (optionally) which model to use — leave the model blank to auto-detect the first one installed
 
-> **Note technique :** `codecrew` parle le protocole Anthropic (Messages API) avec les deux modèles — Claude nativement, et GLM via son endpoint compatible (le GLM Coding Plan de Z.ai, authentifié par jeton porteur). Si ta clé GLM provient d'un autre fournisseur exposant un endpoint compatible OpenAI classique (ex: `bigmodel.cn/api/paas/v4`), elle ne fonctionnera pas telle quelle avec cette version.
+> **Technical note:** `codecrew` speaks the Anthropic protocol (Messages API) with both paid agents — natively for Claude, and via its compatible endpoint for GLM (Z.ai's GLM Coding Plan, authenticated with a bearer token). If your GLM key comes from a provider exposing a classic OpenAI-compatible endpoint instead (e.g. `bigmodel.cn/api/paas/v4`), it won't work as-is with this version.
 
-Les clés sont stockées localement dans le dossier de configuration standard de l'OS (jamais commitées, jamais envoyées ailleurs qu'aux API respectives).
+Keys are stored locally in the OS's standard config directory (never committed, never sent anywhere except the respective APIs).
 
 ```bash
-codecrew config --show   # affiche la configuration actuelle (clés masquées)
+codecrew config --show   # shows the current configuration (keys masked)
 ```
 
-## Utilisation
+## Usage
 
 ```bash
-codecrew "Ajoute une validation d'email au formulaire d'inscription"
+codecrew "Add email validation to the signup form"
 ```
 
-Exemple avec contexte explicite et tests :
+Example with explicit context and tests:
 
 ```bash
-codecrew "Corrige la pagination de l'API /users" \
+codecrew "Fix pagination on the /users API" \
   --files "src/api/**/*.ts" \
   --test "npm test" \
   --effort high
@@ -74,68 +78,78 @@ codecrew "Corrige la pagination de l'API /users" \
 
 | Option | Description |
 | --- | --- |
-| `-f, --files <glob>` | Fichiers à fournir explicitement comme contexte (ex: `"src/**/*.ts"`) |
-| `-e, --effort <level>` | `low\|medium\|high\|xhigh\|max` — profondeur de réflexion de Claude |
-| `-i, --max-iterations <n>` | Nombre max d'allers-retours GLM ↔ Claude par étape |
-| `-t, --test <command>` | Commande à exécuter après implémentation (ex: `"npm test"`) |
-| `--dry-run` | N'écrit rien sur disque, affiche seulement le plan et les diffs proposés |
-| `-r, --root <path>` | Racine du projet (défaut : répertoire courant) |
+| `-f, --files <glob>` | Files to provide as explicit context (e.g. `"src/**/*.ts"`) |
+| `-e, --effort <level>` | `low\|medium\|high\|xhigh\|max` — Claude's thinking depth |
+| `-i, --max-iterations <n>` | Max GLM ↔ Claude round-trips per step |
+| `-t, --test <command>` | Command to run after implementation (e.g. `"npm test"`) |
+| `--dry-run` | Writes nothing to disk, only shows the plan and proposed diffs |
+| `-r, --root <path>` | Project root (defaults to the current directory) |
+| `--no-local` | Disables the local agent (Ollama) for this run, even if detected |
+| `--local-model <name>` | Forces which Ollama model to use (otherwise auto-detected) |
 
 ## Pipeline
 
 ```
-Tâche utilisateur
+User task
       │
       ▼
-1. Contexte local (arborescence + fichiers ciblés)
+1. Local context (file tree + targeted files)
       │
       ▼
-2. Claude ─── génère un plan structuré (étapes, fichiers, instructions)
+2. Claude ─── generates a structured plan (steps, files, instructions, complexity)
       │
       ▼
-3. Pour chaque étape :
-      GLM implémente ──► Claude relit le diff réel ──► approuvé ?
-           ▲                                              │ non
-           └──────────── feedback de correction ◄─────────┘
-      │ oui
-      ▼
-4. Écriture des fichiers sur disque (sauf --dry-run)
+3. For each step:
+      trivial? ──yes──► Ollama implements (local) ──┐
+           │no                                       │
+           ▼                                         │
+      GLM implements ◄─────────────────────────────┘
+           │
+           ▼
+      Claude reviews the actual diff ──► approved?
+           ▲                                │ no
+           └──────────── correction feedback ◄┘
+           │ yes
+           ▼
+4. Files written to disk (unless --dry-run)
       │
       ▼
-5. Exécution optionnelle des tests (--test)
+5. Optional test run (--test)
 ```
 
-## Résilience (repli automatique)
+## Resilience (automatic fallback)
 
-Claude et GLM parlent le même protocole (Anthropic Messages API), donc chacun peut au besoin remplir le rôle de l'autre. Si l'un des deux tombe à court de crédit/quota en cours de route, `codecrew` bascule automatiquement plutôt que d'interrompre le run :
+Claude and GLM speak the same protocol (Anthropic Messages API), so each can fill the other's role when needed. If one runs out of credit/quota mid-run, `codecrew` switches over automatically instead of aborting:
 
-- **GLM indisponible** → Claude implémente lui-même l'étape ; la relecture continue normalement (qualité inchangée, juste plus lent/coûteux côté Claude).
-- **Claude indisponible** → GLM génère le plan et implémente, mais **la relecture indépendante est désactivée** pour le reste du run — `codecrew` te le signale clairement plutôt que de simuler une auto-relecture par le même modèle (qui n'aurait aucune valeur).
-- **Les deux indisponibles** → échec explicite, rien d'autre à faire.
+- **GLM unavailable** → Claude implements the step itself; review continues as normal (same quality, just slower/costlier on the Claude side).
+- **Claude unavailable** → GLM generates the plan and implements, but **independent review is disabled** for the rest of the run — codecrew tells you clearly rather than faking a self-review with the same model (which would be worthless).
+- **Both unavailable** → explicit failure, nothing more to do.
 
-La détection se base sur les erreurs HTTP 429 et les messages mentionnant explicitement un crédit/solde/quota insuffisant — un vrai rate-limit transitoire peut donc aussi déclencher un repli (compromis assumé : mieux vaut basculer à tort que planter tout le pipeline).
+Detection relies on HTTP 429 responses and error messages explicitly mentioning insufficient credit/balance/quota — a genuine transient rate limit can also trigger a fallback (an accepted trade-off: better to switch agents unnecessarily than to crash the whole pipeline).
 
-## Sécurité
+The local Ollama agent follows a separate, simpler rule: it's only ever tried for steps the architect explicitly marked `trivial`, and any failure (model not installed, service down, malformed response) makes it fall back to GLM silently for that step, without affecting Claude/GLM availability.
 
-- Toute écriture de fichier est confinée à la racine du projet (`--root`) : aucun chemin ne peut s'en échapper (`..`, chemins absolus).
-- Les clés API ne sont jamais journalisées ni affichées en clair (`config --show` les masque).
-- **codecrew modifie des fichiers sur disque.** Travaillez sur un dépôt Git propre (ou utilisez `--dry-run`) afin de pouvoir revenir en arrière facilement.
+## Security
 
-## Statut
+- Every file write is confined to the project root (`--root`): no path can escape it (`..`, absolute paths).
+- API keys are never logged or shown in clear text (`config --show` masks them).
+- **codecrew modifies files on disk.** Work on a clean Git checkout (or use `--dry-run`) so you can easily roll back.
 
-v0.1 — squelette fonctionnel et utilisable, base d'une architecture destinée à évoluer (voir les idées ci-dessous).
+## Status
 
-### Pistes d'évolution
+v0.1 — functional, usable skeleton; a foundation meant to evolve (see ideas below).
 
-- Support d'outils supplémentaires (exécution de linters, auto-fix des échecs de tests)
-- Génération de patchs/diffs partiels plutôt que le fichier entier à chaque itération
-- Support d'autres implémenteurs (Qwen, DeepSeek, etc.) via une interface commune
-- Historique de session et reprise d'une tâche interrompue
+### Roadmap ideas
 
-## Contribuer
+- Support for additional tools (running linters, auto-fixing test failures)
+- Partial patch/diff generation instead of the whole file on every iteration
+- Support for other implementers (Qwen, DeepSeek, etc.) through a common interface
+- Session history and resuming an interrupted task
 
-Les contributions sont bienvenues : ouvrez une issue ou une pull request sur [le dépôt GitHub](https://github.com/Danux-Be/codecrew).
+## Contributing
 
-## Licence
+Contributions are welcome: open an issue or a pull request on [the GitHub repo](https://github.com/Danux-Be/codecrew).
+
+## License
 
 [MIT](LICENSE)

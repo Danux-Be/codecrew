@@ -10,6 +10,7 @@ import ora, { type Ora } from "ora";
 
 const claudeTag = chalk.bgBlue.black.bold(" CLAUDE ");
 const glmTag = chalk.bgGreen.black.bold("  GLM   ");
+const localTag = chalk.bgMagenta.black.bold(" LOCAL  ");
 const systemTag = chalk.bgGray.white.bold(" SYSTEM ");
 
 let activeSpinner: Ora | null = null;
@@ -62,12 +63,12 @@ export const logger = {
     console.error(chalk.red.bold("✖ ") + chalk.red(text));
   },
 
-  /** Démarre un spinner attribué à un des deux agents (ou au système). */
-  spinner(actor: "claude" | "glm" | "system", text: string): Ora {
+  /** Démarre un spinner attribué à l'un des agents (ou au système). */
+  spinner(actor: "claude" | "glm" | "local" | "system", text: string): Ora {
     stopActiveSpinner();
-    const tag = actor === "claude" ? claudeTag : actor === "glm" ? glmTag : systemTag;
-    const color = actor === "claude" ? chalk.blueBright : actor === "glm" ? chalk.greenBright : chalk.gray;
-    activeSpinner = ora({ text: `${tag} ${color(text)}` }).start();
+    const tags = { claude: claudeTag, glm: glmTag, local: localTag, system: systemTag };
+    const colors = { claude: chalk.blueBright, glm: chalk.greenBright, local: chalk.magentaBright, system: chalk.gray };
+    activeSpinner = ora({ text: `${tags[actor]} ${colors[actor](text)}` }).start();
     return activeSpinner;
   },
 

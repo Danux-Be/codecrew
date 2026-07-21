@@ -17,6 +17,12 @@ export const PlanStepSchema = z.object({
     .describe(
       "Instructions précises et sans ambiguïté pour l'implémenteur : ce qu'il doit écrire, dans quel(s) fichier(s), en respectant quels contrats/signatures.",
     ),
+  complexity: z
+    .enum(["trivial", "standard"])
+    .optional()
+    .describe(
+      "'trivial' uniquement si l'étape est purement mécanique (fichier de config simple, boilerplate, constantes, texte statique) et peut être confiée sans risque à un petit modèle local ; 'standard' sinon (ou absent). Par défaut traité comme 'standard'.",
+    ),
 });
 
 export const ImplementationPlanSchema = z.object({

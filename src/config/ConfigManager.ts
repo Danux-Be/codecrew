@@ -9,6 +9,11 @@ export interface CodecrewConfig {
   glmModel: string;
   defaultEffort: "low" | "medium" | "high" | "xhigh" | "max";
   maxReviewIterations: number;
+  /** Active la détection/l'utilisation d'un 3ème agent local (Ollama) si présent. */
+  ollamaEnabled: boolean;
+  ollamaBaseUrl: string;
+  /** Modèle Ollama à utiliser ; vide = auto-détection du premier modèle installé. */
+  ollamaModel: string;
 }
 
 const DEFAULTS: CodecrewConfig = {
@@ -17,6 +22,9 @@ const DEFAULTS: CodecrewConfig = {
   glmModel: "glm-4.6",
   defaultEffort: "high",
   maxReviewIterations: 2,
+  ollamaEnabled: true,
+  ollamaBaseUrl: "http://localhost:11434",
+  ollamaModel: "",
 };
 
 /**
@@ -47,6 +55,9 @@ export class ConfigManager {
       glmModel: this.store.get("glmModel"),
       defaultEffort: this.store.get("defaultEffort"),
       maxReviewIterations: this.store.get("maxReviewIterations"),
+      ollamaEnabled: this.store.get("ollamaEnabled"),
+      ollamaBaseUrl: this.store.get("ollamaBaseUrl"),
+      ollamaModel: this.store.get("ollamaModel"),
     };
   }
 

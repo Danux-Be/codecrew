@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { ConfigManager } from "./config/ConfigManager.js";
 import { ClaudeClient, type Effort } from "./clients/ClaudeClient.js";
 import { GLMClient } from "./clients/GLMClient.js";
+import { detectOllama, OllamaClient } from "./clients/OllamaClient.js";
 import { Orchestrator } from "./orchestrator/Orchestrator.js";
 import { logger } from "./ui/logger.js";
 
@@ -41,6 +42,9 @@ export async function main(argv: string[]): Promise<void> {
         console.log(`Modèle GLM       : ${cfg.glmModel}`);
         console.log(`Effort par défaut: ${cfg.defaultEffort}`);
         console.log(`Itérations max   : ${cfg.maxReviewIterations}`);
+        console.log(`Agent local      : ${cfg.ollamaEnabled ? "activé" : "désactivé"}`);
+        console.log(`  URL Ollama     : ${cfg.ollamaBaseUrl}`);
+        console.log(`  Modèle Ollama  : ${cfg.ollamaModel || "(auto-détection)"}`);
         return;
       }
       await runConfigWizard(config);
@@ -57,6 +61,8 @@ export async function main(argv: string[]): Promise<void> {
     .option("-t, --test <command>", "Commande à exécuter après implémentation (ex: \"npm test\")")
     .option("--dry-run", "N'écrit rien sur disque, affiche seulement le plan et les diffs proposés")
     .option("-r, --root <path>", "Répertoire racine du projet (par défaut : répertoire courant)")
+    .option("--no-local", "Désactive l'agent local (Ollama) pour ce run, même s'il est détecté")
+    .option("--local-model <name>", "Force le modèle Ollama à utiliser (sinon auto-détection)")
     .action(async (taskParts: string[], opts) => {
       const task = taskParts.join(" ").trim();
       if (!task) {
@@ -85,7 +91,20 @@ export async function main(argv: string[]): Promise<void> {
 
       const claude = new ClaudeClient({ apiKey: cfg.anthropicApiKey, model: cfg.claudeModel, effort });
       const glm = new GLMClient({ apiKey: cfg.glmApiKey, baseUrl: cfg.glmBaseUrl, model: cfg.glmModel });
-      const orchestrator = new Orchestrator(claude, glm);
+
+      let ollama: OllamaClient | undefined;
+      if (cfg.ollamaEnabled && opts.local !== false) {
+        const detection = await detectOllama(cfg.ollamaBaseUrl);
+        const model = typeof opts.localModel === "string" ? opts.localModel : cfg.ollamaModel || detection.models[0];
+        if (detection.available && model) {
+          ollama = new OllamaClient({ baseUrl: cfg.ollamaBaseUrl, model });
+          logger.info(`Agent local détecté : Ollama (${model}) — utilisé pour les étapes triviales du plan.`);
+        } else if (detection.available) {
+          logger.info("Ollama détecté mais aucun modèle installé — agent local désactivé pour ce run.");
+        }
+      }
+
+      const orchestrator = new Orchestrator(claude, glm, ollama);
 
       try {
         await orchestrator.run({
@@ -158,6 +177,24 @@ async function runConfigWizard(config: ConfigManager): Promise<void> {
         min: 1,
         max: 10,
       },
+      {
+        type: "confirm",
+        name: "ollamaEnabled",
+        message: "Activer un 3ème agent local (Ollama) s'il est détecté, pour les étapes triviales du plan ?",
+        initial: current.ollamaEnabled,
+      },
+      {
+        type: "text",
+        name: "ollamaBaseUrl",
+        message: "URL de base Ollama (agent local, optionnel)",
+        initial: current.ollamaBaseUrl,
+      },
+      {
+        type: "text",
+        name: "ollamaModel",
+        message: "Modèle Ollama à utiliser (laisser vide = auto-détection du premier modèle installé)",
+        initial: current.ollamaModel,
+      },
     ],
     { onCancel: () => process.exit(1) },
   );
@@ -169,6 +206,9 @@ async function runConfigWizard(config: ConfigManager): Promise<void> {
   if (answers.glmModel) config.set("glmModel", answers.glmModel);
   if (answers.defaultEffort) config.set("defaultEffort", answers.defaultEffort);
   if (answers.maxReviewIterations) config.set("maxReviewIterations", answers.maxReviewIterations);
+  if (typeof answers.ollamaEnabled === "boolean") config.set("ollamaEnabled", answers.ollamaEnabled);
+  if (typeof answers.ollamaBaseUrl === "string") config.set("ollamaBaseUrl", answers.ollamaBaseUrl);
+  if (typeof answers.ollamaModel === "string") config.set("ollamaModel", answers.ollamaModel);
 
   logger.success(`Configuration enregistrée dans ${config.path}`);
 }

@@ -22,9 +22,15 @@ export const PLAN_SYSTEM_PROMPT = [
   "Ne découpe pas plus finement que nécessaire : une étape par fichier ou par groupe de fichiers",
   "fortement liés suffit généralement. Base-toi strictement sur le contexte fourni.",
   "",
+  "Pour chaque étape, indique aussi 'complexity' : 'trivial' UNIQUEMENT si l'étape est purement",
+  "mécanique et sans risque (fichier de config simple, boilerplate, constantes, texte statique,",
+  ".gitignore, etc.) — ce type d'étape peut être confié à un petit modèle local peu fiable.",
+  "Utilise 'standard' pour tout ce qui demande un minimum de logique, de jugement ou de contexte",
+  "métier. Sois conservateur : en cas de doute, choisis 'standard'.",
+  "",
   "Réponds STRICTEMENT avec un unique objet JSON valide, sans texte avant/après, sans balises",
   "markdown, respectant exactement cette forme :",
-  '{"summary": string, "steps": [{"id": number, "description": string, "files": string[], "instructions": string}]}',
+  '{"summary": string, "steps": [{"id": number, "description": string, "files": string[], "instructions": string, "complexity": "trivial"|"standard"}]}',
 ].join("\n");
 
 export function buildPlanUserPrompt(task: string, context: ProjectContext): string {
