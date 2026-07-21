@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { z } from "zod";
 
+import { extractFirstText } from "./anthropicCompat.js";
 import {
   ImplementationPlanSchema,
   ReviewResultSchema,
@@ -118,16 +119,7 @@ export class ClaudeClient {
     });
 
     const message = await stream.finalMessage();
-
-    if (message.stop_reason === "refusal") {
-      throw new Error("Claude a refusé de répondre à cette requête (stop_reason: refusal).");
-    }
-
-    const textBlock = message.content.find((b): b is Anthropic.TextBlock => b.type === "text");
-    if (!textBlock) {
-      throw new Error("Claude n'a retourné aucun contenu textuel exploitable.");
-    }
-    return textBlock.text;
+    return extractFirstText(message);
   }
 
   private parseJson<T>(raw: string, schema: z.ZodType<T>, label: string): T {

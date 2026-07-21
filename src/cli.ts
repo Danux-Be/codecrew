@@ -128,13 +128,13 @@ async function runConfigWizard(config: ConfigManager): Promise<void> {
       {
         type: "password",
         name: "glmApiKey",
-        message: "Clé API GLM (Zhipu / compatible)",
+        message: "Clé API GLM (Z.ai / Zhipu, compatible protocole Anthropic)",
         initial: current.glmApiKey ?? "",
       },
       {
         type: "text",
         name: "glmBaseUrl",
-        message: "URL de base de l'API GLM",
+        message: "URL de base de l'API GLM (endpoint compatible Anthropic)",
         initial: current.glmBaseUrl,
       },
       {

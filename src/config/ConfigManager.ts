@@ -4,6 +4,7 @@ export interface CodecrewConfig {
   anthropicApiKey?: string;
   claudeModel: string;
   glmApiKey?: string;
+  /** Endpoint compatible protocole Anthropic (ex: GLM Coding Plan via api.z.ai/api/anthropic). */
   glmBaseUrl: string;
   glmModel: string;
   defaultEffort: "low" | "medium" | "high" | "xhigh" | "max";
@@ -12,7 +13,7 @@ export interface CodecrewConfig {
 
 const DEFAULTS: CodecrewConfig = {
   claudeModel: "claude-opus-4-8",
-  glmBaseUrl: "https://open.bigmodel.cn/api/paas/v4",
+  glmBaseUrl: "https://api.z.ai/api/anthropic",
   glmModel: "glm-4.6",
   defaultEffort: "high",
   maxReviewIterations: 2,

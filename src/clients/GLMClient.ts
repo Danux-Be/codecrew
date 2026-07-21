@@ -1,3 +1,6 @@
+import Anthropic from "@anthropic-ai/sdk";
+
+import { extractFirstText } from "./anthropicCompat.js";
 import type { FileChange } from "./types.js";
 import type { PlanStep } from "./schemas.js";
 
@@ -7,33 +10,25 @@ export interface GLMClientOptions {
   model: string;
 }
 
-interface GLMChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
-}
-
-interface GLMChatCompletionResponse {
-  choices?: Array<{ message?: { content?: string } }>;
-  error?: { message?: string; code?: string };
-}
-
 const FILE_BLOCK_RE = /```file:(\S+)\r?\n([\s\S]*?)```/g;
 
 /**
- * Client pour l'API GLM (Zhipu), compatible avec le format
- * OpenAI /chat/completions. GLM joue le rôle d'implémenteur : il reçoit
- * des instructions précises (issues du plan de Claude, éventuellement
- * enrichies de feedback de relecture) et retourne le contenu complet
- * des fichiers à écrire, dans un format balisé simple à parser.
+ * Client pour GLM en tant qu'implémenteur. GLM (Zhipu/Z.ai) expose un
+ * endpoint compatible avec le protocole Anthropic (ex: le GLM Coding Plan
+ * via `https://api.z.ai/api/anthropic`) — on réutilise donc le SDK Anthropic
+ * lui-même, avec une authentification par jeton porteur (`authToken`) plutôt
+ * que par `x-api-key`, et le modèle GLM passé directement dans `model`.
+ *
+ * GLM reçoit des instructions précises (issues du plan de Claude,
+ * éventuellement enrichies de feedback de relecture) et retourne le contenu
+ * complet des fichiers à écrire, dans un format balisé simple à parser.
  */
 export class GLMClient {
-  private readonly apiKey: string;
-  private readonly baseUrl: string;
+  private readonly client: Anthropic;
   private readonly model: string;
 
   constructor(opts: GLMClientOptions) {
-    this.apiKey = opts.apiKey;
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.client = new Anthropic({ authToken: opts.apiKey, baseURL: opts.baseUrl });
     this.model = opts.model;
   }
 
@@ -75,60 +70,27 @@ export class GLMClient {
       );
     }
 
-    const messages: GLMChatMessage[] = [
-      { role: "system", content: system },
-      { role: "user", content: userParts.join("\n\n") },
-    ];
+    let raw: string;
+    try {
+      const stream = this.client.messages.stream({
+        model: this.model,
+        max_tokens: 16000,
+        system,
+        messages: [{ role: "user", content: userParts.join("\n\n") }],
+      });
+      const message = await stream.finalMessage();
+      raw = extractFirstText(message);
+    } catch (err) {
+      throw new Error(`Erreur lors de l'appel à GLM : ${(err as Error).message}`);
+    }
 
-    const raw = await this.chat(messages);
     const changes = this.parseFileBlocks(raw);
-
     if (changes.length === 0) {
       throw new Error(
         "GLM n'a retourné aucun bloc de fichier reconnaissable (format attendu : ```file:chemin ... ```).",
       );
     }
     return changes;
-  }
-
-  private async chat(messages: GLMChatMessage[]): Promise<string> {
-    const url = `${this.baseUrl}/chat/completions`;
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          messages,
-          stream: false,
-        }),
-      });
-    } catch (err) {
-      throw new Error(`Impossible de joindre l'API GLM (${url}) : ${(err as Error).message}`);
-    }
-
-    const bodyText = await res.text();
-    let body: GLMChatCompletionResponse;
-    try {
-      body = JSON.parse(bodyText) as GLMChatCompletionResponse;
-    } catch {
-      throw new Error(`Réponse GLM non-JSON (HTTP ${res.status}) : ${bodyText.slice(0, 500)}`);
-    }
-
-    if (!res.ok) {
-      const msg = body.error?.message ?? bodyText.slice(0, 500);
-      throw new Error(`Erreur API GLM (HTTP ${res.status}) : ${msg}`);
-    }
-
-    const content = body.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error("Réponse GLM vide ou de forme inattendue.");
-    }
-    return content;
   }
 
   private parseFileBlocks(raw: string): FileChange[] {

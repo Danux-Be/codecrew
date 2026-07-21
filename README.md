@@ -21,8 +21,8 @@ Claude joue l'**architecte et le reviewer** ; GLM joue l'**implémenteur**. Chac
 ## Prérequis
 
 - Node.js ≥ 20
-- Une clé API [Anthropic](https://console.anthropic.com/) (Claude)
-- Une clé API GLM (Zhipu / BigModel) ou toute API compatible avec le format `/chat/completions` d'OpenAI
+- Une clé API [Anthropic](https://console.anthropic.com/) (Claude), avec du crédit disponible
+- Une clé API GLM exposant un endpoint **compatible protocole Anthropic** — typiquement le [GLM Coding Plan de Z.ai](https://z.ai/manage-apikey/apikey-list) (`https://api.z.ai/api/anthropic`), avec quota/crédit disponible sur ce plan spécifiquement (distinct de tout abonnement chat classique)
 
 ## Installation
 
@@ -44,8 +44,10 @@ Demande interactivement :
 - la clé API Anthropic (Claude)
 - le modèle Claude à utiliser (par défaut `claude-opus-4-8`)
 - la clé API GLM
-- l'URL de base et le modèle GLM
+- l'URL de base (par défaut `https://api.z.ai/api/anthropic`) et le modèle GLM (ex: `glm-4.6`, `glm-5.2`)
 - le niveau d'effort par défaut (profondeur de réflexion de Claude) et le nombre max d'itérations de correction par étape
+
+> **Note technique :** `codecrew` parle le protocole Anthropic (Messages API) avec les deux modèles — Claude nativement, et GLM via son endpoint compatible (le GLM Coding Plan de Z.ai, authentifié par jeton porteur). Si ta clé GLM provient d'un autre fournisseur exposant un endpoint compatible OpenAI classique (ex: `bigmodel.cn/api/paas/v4`), elle ne fonctionnera pas telle quelle avec cette version.
 
 Les clés sont stockées localement dans le dossier de configuration standard de l'OS (jamais commitées, jamais envoyées ailleurs qu'aux API respectives).
 
