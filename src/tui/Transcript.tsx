@@ -1,4 +1,4 @@
-import { Box, Static, Text } from "ink";
+import { Box, Text } from "ink";
 
 import type { TranscriptLine } from "./types.js";
 
@@ -12,16 +12,16 @@ const COLORS: Partial<Record<TranscriptLine["kind"], string>> = {
   "diff-context": "gray",
 };
 
-export function Transcript({ lines }: { lines: TranscriptLine[] }) {
+/**
+ * Une ligne du transcript. Rendue à l'intérieur de l'unique `<Static>` de
+ * Session (Ink ne suit qu'un seul nœud static par arbre — voir Session.tsx).
+ */
+export function TranscriptLineRow({ line }: { line: TranscriptLine }) {
   return (
-    <Static items={lines}>
-      {(l) => (
-        <Box key={l.id}>
-          <Text color={COLORS[l.kind]} bold={l.kind === "title" || l.kind === "diff-header"}>
-            {l.text}
-          </Text>
-        </Box>
-      )}
-    </Static>
+    <Box>
+      <Text color={COLORS[line.kind]} bold={line.kind === "title" || line.kind === "diff-header"}>
+        {line.text}
+      </Text>
+    </Box>
   );
 }

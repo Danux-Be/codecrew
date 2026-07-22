@@ -5,8 +5,11 @@ import {
   formatPlanStepLine,
   formatReviewSkippedText,
   formatRunAbortedText,
+  formatRunCancelledText,
   formatRunSummaryText,
   formatStepCompleteText,
+  formatUndoDoneText,
+  formatUndoEmptyText,
 } from "../orchestrator/eventFormatting.js";
 import type { OrchestratorEvent } from "../orchestrator/events.js";
 import type { TranscriptLine } from "./types.js";
@@ -58,6 +61,12 @@ export function eventToLines(e: OrchestratorEvent): TranscriptLine[] {
       return [line("Résumé", "title"), line(formatRunSummaryText(e), "success")];
     case "run:aborted":
       return [line(formatRunAbortedText(e), "warn")];
+    case "run:cancelled":
+      return [line(formatRunCancelledText(), "warn")];
+    case "undo:done":
+      return [line(formatUndoDoneText(e), "success")];
+    case "undo:empty":
+      return [line(formatUndoEmptyText(), "warn")];
     case "run:error":
       return [line(e.message, "error")];
     case "agent:activity":

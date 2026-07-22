@@ -90,13 +90,33 @@ Inside the session:
 | Key / command | Effect |
 | --- | --- |
 | `Shift+Tab` | Cycle the run mode: `auto` → `plan` → `manual` → `auto` |
+| `Esc` | Cancel the task currently running (aborts in-flight API calls at the next checkpoint) |
 | `Ctrl+Q` | Quit the session |
+| `@path/to/file` | Mention a file anywhere in your task to include it as explicit context (autocompletes against the project tree — type `@`, then arrows + Tab) |
+| `\` + Enter | End a line with a backslash to start a new line instead of submitting — classic shell continuation, since a real Shift+Enter can't be reliably detected across terminals |
+| `/` | Typing `/` shows a filterable command menu — arrows to navigate, Tab to complete, Enter to run the highlighted command |
 | `/config` | Show the current configuration (models, effort, iteration cap) |
 | `/model` | Pick a model for Claude, GLM, or the local agent from a menu (Ollama's list is live-detected); persists to config and applies immediately, no restart needed |
+| `/clear` | Clear the displayed transcript (keeps agent statuses and the current mode) |
+| `/undo` | Revert the last applied step (restores or deletes touched files); callable repeatedly to walk back further |
+| `/cost` | Cumulative session cost so far: wall-clock duration and Claude/GLM tokens, across every task run in this session |
+| `/doctor` | Diagnose the current configuration: API keys present, GLM endpoint reachability, Ollama detection, Node version |
+| `/export` | Export the displayed transcript to a Markdown file |
 | `/background` | Save the session's transcript and agent status to disk, then exit — resume later with `codecrew --resume` |
+| `/help` | List all available slash commands |
 | `/exit` | Quit the session (same effect as `Ctrl+Q`) |
 
 > **`/background` scope**: this saves and restores the visible transcript/context so you can pick a conversation back up — it does **not** keep a task actually running while you're disconnected. If a task is in progress, finish it (or let it fail over) before backgrounding.
+
+> **`/undo` scope**: checkpoints (one per applied step) live in memory for the current session only — they don't survive quitting codecrew. `/cost` is similarly session-scoped (resets on restart) but does survive `/model` changes mid-session.
+
+### Project memory (`CODECREW.md`)
+
+Drop a `CODECREW.md` file at the root of your project and codecrew automatically includes its content in every plan-generation prompt — conventions, constraints, architectural notes, anything you want the architect (Claude, or GLM in fallback) to always take into account. It's read fresh on every task, so edits apply immediately, no restart needed.
+
+### End-of-task summary
+
+After every run, codecrew reports the wall-clock duration and the input/output token count consumed by Claude and GLM for that specific task (not cumulative across the session) — e.g. `⏱ 12.4 s · Claude 3.2k in / 1.1k out · GLM 500 in / 2.0k out`.
 
 ### Run modes
 
@@ -181,7 +201,7 @@ v0.1 — functional, usable skeleton; a foundation meant to evolve (see ideas be
 - Partial patch/diff generation instead of the whole file on every iteration
 - Support for other implementers (Qwen, DeepSeek, etc.) through a common interface
 - True detached background execution (`/background` currently saves/restores the transcript, not an in-flight task)
-- Slash-command access to `--files`/`--test` from within the interactive session (currently one-shot only)
+- Slash-command access to `--test` from within the interactive session (currently one-shot only; `--files` is now covered by `@file` mentions)
 
 ## Contributing
 

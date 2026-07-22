@@ -8,8 +8,11 @@ import {
   formatPlanStepLine,
   formatReviewSkippedText,
   formatRunAbortedText,
+  formatRunCancelledText,
   formatRunSummaryText,
   formatStepCompleteText,
+  formatUndoDoneText,
+  formatUndoEmptyText,
 } from "../orchestrator/eventFormatting.js";
 import type { Orchestrator } from "../orchestrator/Orchestrator.js";
 import { logger } from "./logger.js";
@@ -78,6 +81,15 @@ export class ConsoleReporter {
         break;
       case "run:aborted":
         logger.warn(formatRunAbortedText(e));
+        break;
+      case "run:cancelled":
+        logger.warn(formatRunCancelledText());
+        break;
+      case "undo:done":
+        logger.success(formatUndoDoneText(e));
+        break;
+      case "undo:empty":
+        logger.warn(formatUndoEmptyText());
         break;
       // "run:start", "agent:status", "step:awaiting-confirmation", "plan:stopped", "run:error" :
       // rien à afficher côté console au-delà de ce que gèrent déjà les autres événements

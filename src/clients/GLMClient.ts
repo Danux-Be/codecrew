@@ -10,6 +10,7 @@ import {
 } from "./prompts.js";
 import { ImplementationPlanSchema, type ImplementationPlan } from "./schemas.js";
 import type { PlanStep } from "./schemas.js";
+import type { TokenUsage } from "./ClaudeClient.js";
 import type { FileChange, ProjectContext } from "./types.js";
 
 export interface GLMClientOptions {
@@ -35,14 +36,20 @@ export interface GLMClientOptions {
 export class GLMClient {
   private readonly client: Anthropic;
   private readonly model: string;
+  private usage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
 
   constructor(opts: GLMClientOptions) {
     this.client = new Anthropic({ authToken: opts.apiKey, baseURL: opts.baseUrl });
     this.model = opts.model;
   }
 
-  async createPlan(task: string, context: ProjectContext): Promise<ImplementationPlan> {
-    const text = await this.request(PLAN_SYSTEM_PROMPT, buildPlanUserPrompt(task, context));
+  /** Cumul des tokens consommés par cette instance depuis sa création (snapshot, pas remis à zéro). */
+  getUsage(): TokenUsage {
+    return { ...this.usage };
+  }
+
+  async createPlan(task: string, context: ProjectContext, signal?: AbortSignal): Promise<ImplementationPlan> {
+    const text = await this.request(PLAN_SYSTEM_PROMPT, buildPlanUserPrompt(task, context), signal);
     return parseJsonWithSchema(text, ImplementationPlanSchema, "plan d'implémentation");
   }
 
@@ -50,8 +57,13 @@ export class GLMClient {
     step: PlanStep,
     currentFiles: Array<{ path: string; content: string | null }>,
     feedback?: string,
+    signal?: AbortSignal,
   ): Promise<FileChange[]> {
-    const text = await this.request(IMPLEMENT_SYSTEM_PROMPT, buildImplementUserPrompt(step, currentFiles, feedback));
+    const text = await this.request(
+      IMPLEMENT_SYSTEM_PROMPT,
+      buildImplementUserPrompt(step, currentFiles, feedback),
+      signal,
+    );
     const changes = parseFileBlocks(text);
     if (changes.length === 0) {
       throw new Error(
@@ -61,14 +73,19 @@ export class GLMClient {
     return changes;
   }
 
-  private async request(system: string, user: string): Promise<string> {
-    const stream = this.client.messages.stream({
-      model: this.model,
-      max_tokens: 16000,
-      system,
-      messages: [{ role: "user", content: user }],
-    });
+  private async request(system: string, user: string, signal?: AbortSignal): Promise<string> {
+    const stream = this.client.messages.stream(
+      {
+        model: this.model,
+        max_tokens: 16000,
+        system,
+        messages: [{ role: "user", content: user }],
+      },
+      { signal },
+    );
     const message = await stream.finalMessage();
+    this.usage.inputTokens += message.usage.input_tokens;
+    this.usage.outputTokens += message.usage.output_tokens;
     return extractFirstText(message);
   }
 }

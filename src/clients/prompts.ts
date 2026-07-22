@@ -51,11 +51,14 @@ export function buildPlanUserPrompt(task: string, context: ProjectContext): stri
     .join("\n\n");
 
   return [
+    context.memory ? `## Instructions persistantes du projet (CODECREW.md)\n${context.memory}` : null,
     `## Tâche demandée\n${task}`,
     `## Racine du projet\n${context.root}`,
     `## Arborescence (extrait)\n\`\`\`\n${truncatedTree || "(vide)"}\n\`\`\``,
     filesSection ? `## Contenu des fichiers ciblés\n${filesSection}` : "## Aucun fichier explicitement ciblé",
-  ].join("\n\n");
+  ]
+    .filter((s): s is string => s !== null)
+    .join("\n\n");
 }
 
 export const REVIEW_SYSTEM_PROMPT = [

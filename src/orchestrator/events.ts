@@ -42,6 +42,12 @@ export type OrchestratorEvent =
       totalForced: number;
       totalUnreviewed: number;
       totalLocal: number;
+      durationMs: number;
+      claudeTokens: { input: number; output: number };
+      glmTokens: { input: number; output: number };
     }
   | { type: "run:aborted"; atStep: number }
-  | { type: "run:error"; message: string };
+  | { type: "run:cancelled" }
+  | { type: "run:error"; message: string }
+  | { type: "undo:done"; stepId: number; description: string; files: string[] }
+  | { type: "undo:empty" };

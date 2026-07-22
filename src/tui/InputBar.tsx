@@ -13,14 +13,16 @@ export function InputBar({
   running: boolean;
 }) {
   return (
-    <Box>
+    <Box borderStyle="round" borderColor={running ? "yellow" : "cyan"} paddingX={1}>
       <Text color={running ? "yellow" : "cyan"}>{"> "}</Text>
       <TextInput
         value={value}
         onChange={onChange}
         onSubmit={onSubmit}
         placeholder={
-          running ? "tâche en attente, ou /config /model /background /exit" : "tâche, ou /config /model /background /exit"
+          running
+            ? "tâche en attente (Échap pour annuler), ou /help"
+            : "tâche (\\ + Entrée = nouvelle ligne), @fichier, /help"
         }
       />
     </Box>

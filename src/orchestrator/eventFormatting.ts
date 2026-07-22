@@ -40,6 +40,19 @@ export function formatPlanEmptyText(): string {
   return "Le plan ne contient aucune étape. Rien à faire.";
 }
 
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)} s`;
+  const min = Math.floor(s / 60);
+  const rest = Math.round(s % 60);
+  return `${min} min ${rest} s`;
+}
+
+export function formatTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
 export function formatRunSummaryText(e: Extract<OrchestratorEvent, { type: "run:summary" }>): string {
   const notes: string[] = [];
   if (e.totalForced > 0) {
@@ -51,8 +64,29 @@ export function formatRunSummaryText(e: Extract<OrchestratorEvent, { type: "run:
   if (e.totalLocal > 0) {
     notes.push(`${e.totalLocal} étape(s) implémentée(s) localement (Ollama)`);
   }
-  return (
+  const base =
     `${e.totalSteps} étape(s) traitée(s), ${e.totalApplied} fichier(s) touché(s)` +
-    (notes.length > 0 ? `, dont ${notes.join(", ")}.` : ".")
-  );
+    (notes.length > 0 ? `, dont ${notes.join(", ")}.` : ".");
+
+  const costParts: string[] = [`⏱ ${formatDuration(e.durationMs)}`];
+  if (e.claudeTokens.input > 0 || e.claudeTokens.output > 0) {
+    costParts.push(`Claude ${formatTokens(e.claudeTokens.input)} in / ${formatTokens(e.claudeTokens.output)} out`);
+  }
+  if (e.glmTokens.input > 0 || e.glmTokens.output > 0) {
+    costParts.push(`GLM ${formatTokens(e.glmTokens.input)} in / ${formatTokens(e.glmTokens.output)} out`);
+  }
+
+  return `${base}\n${costParts.join(" · ")}`;
+}
+
+export function formatRunCancelledText(): string {
+  return "Tâche annulée par l'utilisateur (Échap).";
+}
+
+export function formatUndoDoneText(e: Extract<OrchestratorEvent, { type: "undo:done" }>): string {
+  return `Annulé — étape ${e.stepId} (${e.description}) : ${e.files.join(", ")} restauré(s).`;
+}
+
+export function formatUndoEmptyText(): string {
+  return "Rien à annuler.";
 }

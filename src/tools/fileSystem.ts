@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import fg from "fast-glob";
 
@@ -43,6 +43,11 @@ export async function readFileIfExists(absPath: string): Promise<string | null> 
 export async function writeFileEnsured(absPath: string, content: string): Promise<void> {
   await mkdir(dirname(absPath), { recursive: true });
   await writeFile(absPath, content, "utf8");
+}
+
+/** Supprime un fichier s'il existe (utilisé par /undo pour annuler une création). */
+export async function deleteFileIfExists(absPath: string): Promise<void> {
+  await rm(absPath, { force: true });
 }
 
 /** Liste l'arborescence du projet (chemins relatifs), pour donner du contexte à Claude. */

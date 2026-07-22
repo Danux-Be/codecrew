@@ -6,6 +6,8 @@ export interface ProjectContext {
   fileTree: string[];
   /** Fichiers explicitement ciblés par l'utilisateur, avec leur contenu actuel. */
   targetedFiles: Array<{ path: string; content: string }>;
+  /** Contenu de CODECREW.md à la racine du projet, s'il existe (conventions, contraintes persistantes). */
+  memory?: string;
 }
 
 /** Un changement de fichier proposé par l'implémenteur (GLM). */

@@ -1,12 +1,13 @@
 import { EventEmitter } from "node:events";
 
-import { isQuotaExhaustedError } from "../clients/anthropicCompat.js";
-import { ClaudeClient } from "../clients/ClaudeClient.js";
+import { isAbortError, isQuotaExhaustedError } from "../clients/anthropicCompat.js";
+import { ClaudeClient, type TokenUsage } from "../clients/ClaudeClient.js";
 import { GLMClient } from "../clients/GLMClient.js";
 import type { OllamaClient } from "../clients/OllamaClient.js";
 import type { ImplementationPlan, PlanStep } from "../clients/schemas.js";
 import type { FileChange, ProjectContext } from "../clients/types.js";
 import {
+  deleteFileIfExists,
   listProjectTree,
   readFileIfExists,
   resolveFilesGlob,
@@ -15,15 +16,32 @@ import {
 } from "../tools/fileSystem.js";
 import { runCommand } from "../tools/terminal.js";
 import { computeFileDiff } from "../utils/diffing.js";
+import { extractMentionedFiles } from "../utils/mentions.js";
 import type { OrchestratorEvent, RunMode } from "./events.js";
 import type { OrchestratorHooks } from "./hooks.js";
 import type { RunOptions } from "./types.js";
+
+const MEMORY_FILENAME = "CODECREW.md";
 
 interface StepOutcome {
   changes: FileChange[];
   forcedByIterationLimit: boolean;
   reviewSkipped: boolean;
   localUsed: boolean;
+}
+
+/** Snapshot du contenu précédent des fichiers touchés par une étape appliquée, pour /undo. */
+interface Checkpoint {
+  root: string;
+  stepId: number;
+  description: string;
+  files: Array<{ path: string; previousContent: string | null }>;
+}
+
+export interface SessionStats {
+  durationMs: number;
+  claudeTokens: TokenUsage;
+  glmTokens: TokenUsage;
 }
 
 type ImplementAgent = "local" | "glm" | "claude";
@@ -66,6 +84,16 @@ export class Orchestrator extends EventEmitter {
   private glmAvailable = true;
   private ollamaAvailable: boolean;
 
+  /** Pile de snapshots pour /undo — un par étape appliquée (ni dry-run, ni "plan"). */
+  private checkpoints: Checkpoint[] = [];
+
+  /** Cumul depuis le début de la session (survit aux changements de modèle via /model), pour /cost. */
+  private sessionStats: SessionStats = {
+    durationMs: 0,
+    claudeTokens: { inputTokens: 0, outputTokens: 0 },
+    glmTokens: { inputTokens: 0, outputTokens: 0 },
+  };
+
   constructor(
     private claude: ClaudeClient,
     private glm: GLMClient,
@@ -77,6 +105,39 @@ export class Orchestrator extends EventEmitter {
 
   private send(event: OrchestratorEvent): void {
     this.emit("event", event);
+  }
+
+  getSessionStats(): SessionStats {
+    return {
+      durationMs: this.sessionStats.durationMs,
+      claudeTokens: { ...this.sessionStats.claudeTokens },
+      glmTokens: { ...this.sessionStats.glmTokens },
+    };
+  }
+
+  /**
+   * Annule la dernière étape appliquée (restaure le contenu précédent des
+   * fichiers touchés, ou les supprime s'ils ont été créés) — un snapshot
+   * par étape, en mémoire pour la durée de la session. Rappeler plusieurs
+   * fois annule les étapes précédentes une par une, dans l'ordre inverse.
+   */
+  async undoLast(): Promise<{ stepId: number; description: string; files: string[] } | null> {
+    const checkpoint = this.checkpoints.pop();
+    if (!checkpoint) {
+      this.send({ type: "undo:empty" });
+      return null;
+    }
+    for (const f of checkpoint.files) {
+      const abs = resolveInRoot(checkpoint.root, f.path);
+      if (f.previousContent === null) {
+        await deleteFileIfExists(abs);
+      } else {
+        await writeFileEnsured(abs, f.previousContent);
+      }
+    }
+    const result = { stepId: checkpoint.stepId, description: checkpoint.description, files: checkpoint.files.map((f) => f.path) };
+    this.send({ type: "undo:done", ...result });
+    return result;
   }
 
   /**
@@ -109,6 +170,39 @@ export class Orchestrator extends EventEmitter {
       throw new Error("Le mode manuel nécessite une confirmation utilisateur (hooks.confirmStep manquant).");
     }
 
+    const stats = {
+      startedAt: Date.now(),
+      claudeUsageBefore: this.claude.getUsage(),
+      glmUsageBefore: this.glm.getUsage(),
+    };
+
+    try {
+      await this.runInner(options, mode, stats, hooks);
+    } catch (err) {
+      if (isAbortError(err)) {
+        this.send({ type: "run:cancelled" });
+        return;
+      }
+      throw err;
+    } finally {
+      // Toujours cumulé, même sur annulation/erreur : les tokens déjà
+      // consommés avant l'interruption comptent pour /cost.
+      const claudeAfter = this.claude.getUsage();
+      const glmAfter = this.glm.getUsage();
+      this.sessionStats.durationMs += Date.now() - stats.startedAt;
+      this.sessionStats.claudeTokens.inputTokens += claudeAfter.inputTokens - stats.claudeUsageBefore.inputTokens;
+      this.sessionStats.claudeTokens.outputTokens += claudeAfter.outputTokens - stats.claudeUsageBefore.outputTokens;
+      this.sessionStats.glmTokens.inputTokens += glmAfter.inputTokens - stats.glmUsageBefore.inputTokens;
+      this.sessionStats.glmTokens.outputTokens += glmAfter.outputTokens - stats.glmUsageBefore.outputTokens;
+    }
+  }
+
+  private async runInner(
+    options: RunOptions,
+    mode: RunMode,
+    stats: { startedAt: number; claudeUsageBefore: TokenUsage; glmUsageBefore: TokenUsage },
+    hooks?: OrchestratorHooks,
+  ): Promise<void> {
     this.send({ type: "run:start", task: options.task, mode });
     this.send({
       type: "agent:status",
@@ -123,7 +217,7 @@ export class Orchestrator extends EventEmitter {
     });
 
     const context = await this.buildContext(options);
-    const plan = await this.generatePlan(options.task, context);
+    const plan = await this.generatePlan(options.task, context, options.signal);
 
     this.send({ type: "plan:generated", summary: plan.summary, steps: plan.steps });
 
@@ -143,6 +237,7 @@ export class Orchestrator extends EventEmitter {
     let totalLocal = 0;
 
     for (const [i, step] of plan.steps.entries()) {
+      options.signal?.throwIfAborted();
       const index = i + 1;
       const total = plan.steps.length;
       this.send({ type: "step:start", stepId: step.id, index, total, description: step.description, files: step.files });
@@ -160,6 +255,12 @@ export class Orchestrator extends EventEmitter {
       const outcome = await this.implementStepWithReview(step, baseline, options);
 
       if (!options.dryRun) {
+        this.checkpoints.push({
+          root: options.root,
+          stepId: step.id,
+          description: step.description,
+          files: outcome.changes.map((c) => ({ path: c.path, previousContent: baseline.get(c.path) ?? null })),
+        });
         for (const change of outcome.changes) {
           const abs = resolveInRoot(options.root, change.path);
           await writeFileEnsured(abs, change.content);
@@ -185,6 +286,18 @@ export class Orchestrator extends EventEmitter {
       await this.runTests(options);
     }
 
+    const claudeUsageAfter = this.claude.getUsage();
+    const glmUsageAfter = this.glm.getUsage();
+    const runDurationMs = Date.now() - stats.startedAt;
+    const runClaudeTokens = {
+      input: claudeUsageAfter.inputTokens - stats.claudeUsageBefore.inputTokens,
+      output: claudeUsageAfter.outputTokens - stats.claudeUsageBefore.outputTokens,
+    };
+    const runGlmTokens = {
+      input: glmUsageAfter.inputTokens - stats.glmUsageBefore.inputTokens,
+      output: glmUsageAfter.outputTokens - stats.glmUsageBefore.outputTokens,
+    };
+
     this.send({
       type: "run:summary",
       totalSteps: plan.steps.length,
@@ -192,6 +305,9 @@ export class Orchestrator extends EventEmitter {
       totalForced,
       totalUnreviewed,
       totalLocal,
+      durationMs: runDurationMs,
+      claudeTokens: runClaudeTokens,
+      glmTokens: runGlmTokens,
     });
   }
 
@@ -200,14 +316,15 @@ export class Orchestrator extends EventEmitter {
    * épuisés), bascule sur GLM. Si les deux échouent pour la même raison,
    * l'erreur est propagée.
    */
-  private async generatePlan(task: string, context: ProjectContext): Promise<ImplementationPlan> {
+  private async generatePlan(task: string, context: ProjectContext, signal?: AbortSignal): Promise<ImplementationPlan> {
     if (this.claudeAvailable) {
       this.send({ type: "agent:activity", actor: "claude", phase: "plan", state: "start", text: "Analyse du projet et génération du plan d'implémentation..." });
       try {
-        const plan = await this.claude.createPlan(task, context);
+        const plan = await this.claude.createPlan(task, context, signal);
         this.send({ type: "agent:activity", actor: "claude", phase: "plan", state: "success", text: "Plan généré par Claude." });
         return plan;
       } catch (err) {
+        if (isAbortError(err)) throw err;
         if (!isQuotaExhaustedError(err)) {
           this.send({ type: "agent:activity", actor: "claude", phase: "plan", state: "error", text: "Échec de la génération du plan." });
           throw err;
@@ -227,10 +344,11 @@ export class Orchestrator extends EventEmitter {
     if (this.glmAvailable) {
       this.send({ type: "agent:activity", actor: "glm", phase: "plan", state: "start", text: "Génération du plan d'implémentation (Claude indisponible)..." });
       try {
-        const plan = await this.glm.createPlan(task, context);
+        const plan = await this.glm.createPlan(task, context, signal);
         this.send({ type: "agent:activity", actor: "glm", phase: "plan", state: "success", text: "Plan généré par GLM." });
         return plan;
       } catch (err) {
+        if (isAbortError(err)) throw err;
         if (!isQuotaExhaustedError(err)) {
           this.send({ type: "agent:activity", actor: "glm", phase: "plan", state: "error", text: "Échec de la génération du plan." });
           throw err;
@@ -261,8 +379,9 @@ export class Orchestrator extends EventEmitter {
     let localUsed = false;
 
     for (let iteration = 1; iteration <= options.maxIterations; iteration++) {
+      options.signal?.throwIfAborted();
       const currentFiles = step.files.map((path) => ({ path, content: baseline.get(path) ?? null }));
-      const { changes, agent } = await this.implementStep(step, currentFiles, feedback, iteration);
+      const { changes, agent } = await this.implementStep(step, currentFiles, feedback, iteration, options.signal);
       lastChanges = changes;
       if (agent === "local") localUsed = true;
 
@@ -277,8 +396,9 @@ export class Orchestrator extends EventEmitter {
       this.send({ type: "agent:activity", actor: "claude", phase: "review", state: "start", text: "Relecture du code..." });
       let review;
       try {
-        review = await this.claude.reviewChanges(step.description, step.instructions, diffs);
+        review = await this.claude.reviewChanges(step.description, step.instructions, diffs, options.signal);
       } catch (err) {
+        if (isAbortError(err)) throw err;
         if (!isQuotaExhaustedError(err)) {
           this.send({ type: "agent:activity", actor: "claude", phase: "review", state: "error", text: "Échec de la relecture." });
           throw err;
@@ -358,16 +478,18 @@ export class Orchestrator extends EventEmitter {
     currentFiles: Array<{ path: string; content: string | null }>,
     feedback: string | undefined,
     iteration: number,
+    signal?: AbortSignal,
   ): Promise<{ changes: FileChange[]; agent: ImplementAgent }> {
     const label = iteration === 1 ? "Implémentation..." : `Implémentation (correction ${iteration - 1})...`;
 
     if (this.ollama && this.ollamaAvailable && step.complexity === "trivial") {
       this.send({ type: "agent:activity", actor: "ollama", phase: "implement", state: "start", text: `${label} (étape triviale)` });
       try {
-        const changes = await this.ollama.implementStep(step, currentFiles, feedback);
+        const changes = await this.ollama.implementStep(step, currentFiles, feedback, signal);
         this.send({ type: "agent:activity", actor: "ollama", phase: "implement", state: "success", text: "Code généré localement (Ollama)." });
         return { changes, agent: "local" };
       } catch (err) {
+        if (isAbortError(err)) throw err;
         this.ollamaAvailable = false;
         this.send({ type: "agent:status", agent: "ollama", status: "unavailable", reason: "runtime-error" });
         this.send({
@@ -383,10 +505,11 @@ export class Orchestrator extends EventEmitter {
     if (this.glmAvailable) {
       this.send({ type: "agent:activity", actor: "glm", phase: "implement", state: "start", text: label });
       try {
-        const changes = await this.glm.implementStep(step, currentFiles, feedback);
+        const changes = await this.glm.implementStep(step, currentFiles, feedback, signal);
         this.send({ type: "agent:activity", actor: "glm", phase: "implement", state: "success", text: "Code généré par GLM." });
         return { changes, agent: "glm" };
       } catch (err) {
+        if (isAbortError(err)) throw err;
         if (!isQuotaExhaustedError(err)) {
           this.send({ type: "agent:activity", actor: "glm", phase: "implement", state: "error", text: "Échec de l'implémentation." });
           throw err;
@@ -406,10 +529,11 @@ export class Orchestrator extends EventEmitter {
     if (this.claudeAvailable) {
       this.send({ type: "agent:activity", actor: "claude", phase: "implement", state: "start", text: `${label} (GLM indisponible)` });
       try {
-        const changes = await this.claude.implementStep(step, currentFiles, feedback);
+        const changes = await this.claude.implementStep(step, currentFiles, feedback, signal);
         this.send({ type: "agent:activity", actor: "claude", phase: "implement", state: "success", text: "Code généré par Claude." });
         return { changes, agent: "claude" };
       } catch (err) {
+        if (isAbortError(err)) throw err;
         if (!isQuotaExhaustedError(err)) {
           this.send({ type: "agent:activity", actor: "claude", phase: "implement", state: "error", text: "Échec de l'implémentation." });
           throw err;
@@ -437,20 +561,29 @@ export class Orchestrator extends EventEmitter {
   private async buildContext(options: RunOptions): Promise<ProjectContext> {
     const fileTree = await listProjectTree(options.root);
 
-    let targetedPaths: string[] = [];
-    if (options.filesGlob) {
-      targetedPaths = await resolveFilesGlob(options.root, options.filesGlob);
-    }
+    const globPaths = options.filesGlob ? await resolveFilesGlob(options.root, options.filesGlob) : [];
+    const mentionedPaths = extractMentionedFiles(options.task);
+    const targetedPaths = [...new Set([...globPaths, ...mentionedPaths])];
 
-    const targetedFiles = await Promise.all(
-      targetedPaths.map(async (path) => {
-        const abs = resolveInRoot(options.root, path);
-        const content = (await readFileIfExists(abs)) ?? "";
-        return { path, content };
-      }),
-    );
+    const targetedFiles = (
+      await Promise.all(
+        targetedPaths.map(async (path) => {
+          try {
+            const abs = resolveInRoot(options.root, path);
+            const content = await readFileIfExists(abs);
+            return content === null ? null : { path, content };
+          } catch {
+            // Mention `@chemin` invalide ou hors racine (ex: @../secret) : ignorée silencieusement,
+            // comme un glob --files qui ne matche rien.
+            return null;
+          }
+        }),
+      )
+    ).filter((f): f is { path: string; content: string } => f !== null);
 
-    return { root: options.root, fileTree, targetedFiles };
+    const memory = await readFileIfExists(resolveInRoot(options.root, MEMORY_FILENAME));
+
+    return { root: options.root, fileTree, targetedFiles, memory: memory ?? undefined };
   }
 
   private async runTests(options: RunOptions): Promise<void> {

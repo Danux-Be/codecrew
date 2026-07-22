@@ -22,4 +22,6 @@ export interface RunOptions {
    * "manual" : demande confirmation une fois par étape, avant sa première tentative d'implémentation.
    */
   mode?: RunMode;
+  /** Permet d'annuler le run en cours (Échap dans le TUI) — abandonne dès le prochain point de contrôle. */
+  signal?: AbortSignal;
 }

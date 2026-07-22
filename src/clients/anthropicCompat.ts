@@ -38,3 +38,14 @@ export function isQuotaExhaustedError(err: unknown): boolean {
   if (err instanceof Error && QUOTA_KEYWORDS.test(err.message)) return true;
   return false;
 }
+
+/**
+ * Détecte une annulation volontaire (Échap dans le TUI) via `AbortSignal`,
+ * pour la distinguer d'un vrai échec réseau/API et éviter de la traiter
+ * comme un motif de repli Claude <-> GLM.
+ */
+export function isAbortError(err: unknown): boolean {
+  if (err instanceof Anthropic.APIUserAbortError) return true;
+  if (err instanceof Error && err.name === "AbortError") return true;
+  return false;
+}

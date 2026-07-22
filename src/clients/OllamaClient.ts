@@ -71,6 +71,7 @@ export class OllamaClient {
     step: PlanStep,
     currentFiles: Array<{ path: string; content: string | null }>,
     feedback?: string,
+    signal?: AbortSignal,
   ): Promise<FileChange[]> {
     const user = buildImplementUserPrompt(step, currentFiles, feedback);
 
@@ -87,6 +88,7 @@ export class OllamaClient {
           ],
           stream: false,
         }),
+        signal,
       });
     } catch (err) {
       throw new Error(`Impossible de joindre Ollama (${this.baseUrl}) : ${(err as Error).message}`);
