@@ -61,20 +61,54 @@ codecrew config --show   # shows the current configuration (keys masked)
 
 ## Usage
 
+### One-shot (scripts, CI)
+
 ```bash
 codecrew "Add email validation to the signup form"
 ```
 
-Example with explicit context and tests:
+Example with explicit context, tests, and a run mode:
 
 ```bash
 codecrew "Fix pagination on the /users API" \
   --files "src/api/**/*.ts" \
   --test "npm test" \
-  --effort high
+  --effort high \
+  --mode manual
 ```
 
-### Options
+### Interactive session
+
+Run `codecrew` with no arguments to launch a persistent, Claude-Code-style interactive session: a header showing the current mode and a live green/red/grey status bubble per agent, a scrolling transcript, and an input bar at the bottom where you can submit any number of tasks one after another without restarting the process.
+
+```bash
+codecrew
+```
+
+Inside the session:
+
+| Key / command | Effect |
+| --- | --- |
+| `Shift+Tab` | Cycle the run mode: `auto` → `plan` → `manual` → `auto` |
+| `Ctrl+Q` | Quit the session |
+| `/config` | Show the current configuration (models, effort, iteration cap) |
+| `/model` | Pick a model for Claude, GLM, or the local agent from a menu (Ollama's list is live-detected); persists to config and applies immediately, no restart needed |
+| `/background` | Save the session's transcript and agent status to disk, then exit — resume later with `codecrew --resume` |
+| `/exit` | Quit the session (same effect as `Ctrl+Q`) |
+
+> **`/background` scope**: this saves and restores the visible transcript/context so you can pick a conversation back up — it does **not** keep a task actually running while you're disconnected. If a task is in progress, finish it (or let it fail over) before backgrounding.
+
+### Run modes
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` (default) | Fully autonomous — plans, implements every step with review/fallback, applies changes. |
+| `plan` | Generates and shows the plan, then stops. No implementation, no review, nothing written. |
+| `manual` | Pauses once per step, before that step's first implementation attempt, for a yes/no confirmation. Declining aborts the run. |
+
+`--dry-run` is orthogonal to modes: it still implements and reviews every step (diffs shown) but never writes to disk — combine it with any mode.
+
+### Options (one-shot command)
 
 | Option | Description |
 | --- | --- |
@@ -86,6 +120,8 @@ codecrew "Fix pagination on the /users API" \
 | `-r, --root <path>` | Project root (defaults to the current directory) |
 | `--no-local` | Disables the local agent (Ollama) for this run, even if detected |
 | `--local-model <name>` | Forces which Ollama model to use (otherwise auto-detected) |
+| `-m, --mode <mode>` | Run mode: `auto` (default) \| `plan` \| `manual` — `manual` requires a real TTY |
+| `--resume [id]` | Launches the interactive session resuming a saved one (latest if no id given) |
 
 ## Pipeline
 
@@ -144,7 +180,8 @@ v0.1 — functional, usable skeleton; a foundation meant to evolve (see ideas be
 - Support for additional tools (running linters, auto-fixing test failures)
 - Partial patch/diff generation instead of the whole file on every iteration
 - Support for other implementers (Qwen, DeepSeek, etc.) through a common interface
-- Session history and resuming an interrupted task
+- True detached background execution (`/background` currently saves/restores the transcript, not an in-flight task)
+- Slash-command access to `--files`/`--test` from within the interactive session (currently one-shot only)
 
 ## Contributing
 

@@ -1,4 +1,5 @@
 import type { Effort } from "../clients/ClaudeClient.js";
+import type { RunMode } from "./events.js";
 
 export interface RunOptions {
   /** Description de la tâche à réaliser, fournie par l'utilisateur. */
@@ -15,4 +16,10 @@ export interface RunOptions {
   testCommand?: string;
   /** Si vrai, n'écrit rien sur disque : affiche seulement le plan et les diffs proposés. */
   dryRun: boolean;
+  /**
+   * "auto" (défaut) : comportement actuel, entièrement autonome.
+   * "plan" : génère et affiche le plan puis s'arrête — aucune implémentation, aucune relecture.
+   * "manual" : demande confirmation une fois par étape, avant sa première tentative d'implémentation.
+   */
+  mode?: RunMode;
 }

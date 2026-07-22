@@ -3,16 +3,23 @@ import prompts from "prompts";
 import { resolve } from "node:path";
 
 import { ConfigManager } from "./config/ConfigManager.js";
-import { ClaudeClient, type Effort } from "./clients/ClaudeClient.js";
-import { GLMClient } from "./clients/GLMClient.js";
-import { detectOllama, OllamaClient } from "./clients/OllamaClient.js";
+import type { Effort } from "./clients/ClaudeClient.js";
+import { buildClients } from "./cli/buildClients.js";
+import { createCliConfirmStep } from "./cli/manualConfirm.js";
 import { Orchestrator } from "./orchestrator/Orchestrator.js";
+import type { RunMode } from "./orchestrator/events.js";
+import { ConsoleReporter } from "./ui/ConsoleReporter.js";
 import { logger } from "./ui/logger.js";
 
 const EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
+const MODE_VALUES = ["auto", "plan", "manual"] as const;
 
 function isEffort(value: string): value is Effort {
   return (EFFORT_VALUES as readonly string[]).includes(value);
+}
+
+function isMode(value: string): value is RunMode {
+  return (MODE_VALUES as readonly string[]).includes(value);
 }
 
 export async function main(argv: string[]): Promise<void> {
@@ -63,12 +70,10 @@ export async function main(argv: string[]): Promise<void> {
     .option("-r, --root <path>", "Répertoire racine du projet (par défaut : répertoire courant)")
     .option("--no-local", "Désactive l'agent local (Ollama) pour ce run, même s'il est détecté")
     .option("--local-model <name>", "Force le modèle Ollama à utiliser (sinon auto-détection)")
+    .option("-m, --mode <mode>", "Mode d'exécution (auto|plan|manual)", "auto")
+    .option("--resume [id]", "Reprend une session interactive précédente (la plus récente si aucun id fourni)")
     .action(async (taskParts: string[], opts) => {
       const task = taskParts.join(" ").trim();
-      if (!task) {
-        program.help();
-        return;
-      }
 
       if (!config.isConfigured()) {
         logger.warn("codecrew n'est pas encore configuré (clés API manquantes).");
@@ -88,34 +93,45 @@ export async function main(argv: string[]): Promise<void> {
           ? opts.maxIterations
           : cfg.maxReviewIterations;
       const root = resolve(typeof opts.root === "string" ? opts.root : process.cwd());
+      const mode = typeof opts.mode === "string" && isMode(opts.mode) ? opts.mode : "auto";
 
-      const claude = new ClaudeClient({ apiKey: cfg.anthropicApiKey, model: cfg.claudeModel, effort });
-      const glm = new GLMClient({ apiKey: cfg.glmApiKey, baseUrl: cfg.glmBaseUrl, model: cfg.glmModel });
-
-      let ollama: OllamaClient | undefined;
-      if (cfg.ollamaEnabled && opts.local !== false) {
-        const detection = await detectOllama(cfg.ollamaBaseUrl);
-        const model = typeof opts.localModel === "string" ? opts.localModel : cfg.ollamaModel || detection.models[0];
-        if (detection.available && model) {
-          ollama = new OllamaClient({ baseUrl: cfg.ollamaBaseUrl, model });
-          logger.info(`Agent local détecté : Ollama (${model}) — utilisé pour les étapes triviales du plan.`);
-        } else if (detection.available) {
-          logger.info("Ollama détecté mais aucun modèle installé — agent local désactivé pour ce run.");
-        }
+      if (!task) {
+        const resumeId: string | true | undefined =
+          opts.resume === true ? true : typeof opts.resume === "string" ? opts.resume : undefined;
+        const { runInteractiveSession } = await import("./tui/index.js");
+        await runInteractiveSession({ configManager: config, root, maxIterations, resumeId });
+        return;
       }
 
-      const orchestrator = new Orchestrator(claude, glm, ollama);
+      if (mode === "manual" && !process.stdin.isTTY) {
+        logger.error("Le mode manuel nécessite un terminal interactif (pas de TTY détecté).");
+        process.exitCode = 1;
+        return;
+      }
 
       try {
-        await orchestrator.run({
-          task,
-          root,
-          filesGlob: typeof opts.files === "string" ? opts.files : undefined,
+        const { claude, glm, ollama } = await buildClients(cfg, {
           effort,
-          maxIterations,
-          testCommand: typeof opts.test === "string" ? opts.test : undefined,
-          dryRun: Boolean(opts.dryRun),
+          localEnabled: opts.local !== false,
+          localModel: typeof opts.localModel === "string" ? opts.localModel : undefined,
         });
+
+        const orchestrator = new Orchestrator(claude, glm, ollama);
+        new ConsoleReporter().attach(orchestrator);
+
+        await orchestrator.run(
+          {
+            task,
+            root,
+            filesGlob: typeof opts.files === "string" ? opts.files : undefined,
+            effort,
+            maxIterations,
+            testCommand: typeof opts.test === "string" ? opts.test : undefined,
+            dryRun: Boolean(opts.dryRun),
+            mode,
+          },
+          mode === "manual" ? { confirmStep: createCliConfirmStep() } : undefined,
+        );
       } catch (err) {
         logger.stopSpinner();
         logger.error((err as Error).message);

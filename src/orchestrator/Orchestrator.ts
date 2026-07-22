@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+
 import { isQuotaExhaustedError } from "../clients/anthropicCompat.js";
 import { ClaudeClient } from "../clients/ClaudeClient.js";
 import { GLMClient } from "../clients/GLMClient.js";
@@ -13,7 +15,8 @@ import {
 } from "../tools/fileSystem.js";
 import { runCommand } from "../tools/terminal.js";
 import { computeFileDiff } from "../utils/diffing.js";
-import { logger } from "../ui/logger.js";
+import type { OrchestratorEvent, RunMode } from "./events.js";
+import type { OrchestratorHooks } from "./hooks.js";
 import type { RunOptions } from "./types.js";
 
 interface StepOutcome {
@@ -30,6 +33,11 @@ type ImplementAgent = "local" | "glm" | "claude";
  * (implémentation) étape par étape, avec une boucle de correction bornée
  * avant application des modifications sur le disque.
  *
+ * N'écrit jamais directement dans le terminal : émet des événements
+ * structurés (`OrchestratorEvent`, canal `"event"`) consommés indifféremment
+ * par le rendu console one-shot (`ConsoleReporter`) ou par le TUI interactif
+ * (Ink) — voir `src/orchestrator/events.ts`.
+ *
  * Résilience : si l'un des deux agents tombe à court de crédit/quota en
  * cours de route, l'orchestrateur bascule automatiquement sur l'autre pour
  * le rôle concerné plutôt que d'interrompre tout le run :
@@ -44,33 +52,88 @@ type ImplementAgent = "local" | "glm" | "claude";
  * tokens Claude/GLM sur les tâches purement mécaniques. Toute panne locale
  * (modèle non installé, service arrêté, réponse invalide) déclenche un
  * repli silencieux sur GLM (puis Claude) — jamais un échec du run.
+ *
+ * Modes (`RunOptions.mode`, défaut "auto") :
+ * - "auto" : comportement ci-dessus, entièrement autonome.
+ * - "plan" : génère et affiche le plan puis s'arrête (aucun appel
+ *   implémentation/relecture).
+ * - "manual" : demande confirmation une fois par étape (via
+ *   `hooks.confirmStep`), avant sa première tentative d'implémentation ;
+ *   la boucle de correction interne à l'étape n'est jamais re-confirmée.
  */
-export class Orchestrator {
+export class Orchestrator extends EventEmitter {
   private claudeAvailable = true;
   private glmAvailable = true;
   private ollamaAvailable: boolean;
 
   constructor(
-    private readonly claude: ClaudeClient,
-    private readonly glm: GLMClient,
-    private readonly ollama?: OllamaClient,
+    private claude: ClaudeClient,
+    private glm: GLMClient,
+    private ollama?: OllamaClient,
   ) {
+    super();
     this.ollamaAvailable = Boolean(ollama);
   }
 
-  async run(options: RunOptions): Promise<void> {
-    const context = await this.buildContext(options);
+  private send(event: OrchestratorEvent): void {
+    this.emit("event", event);
+  }
 
-    const plan = await this.generatePlan(options.task, context);
+  /**
+   * Remplace le client d'un agent en cours de session (ex: changement de
+   * modèle via `/model` dans le TUI) sans recréer l'Orchestrator — le
+   * transcript et les autres statuts d'agents sont préservés. Réinitialise
+   * l'agent concerné comme disponible (nouvelle instance de client).
+   */
+  setClaudeClient(client: ClaudeClient): void {
+    this.claude = client;
+    this.claudeAvailable = true;
+    this.send({ type: "agent:status", agent: "claude", status: "available" });
+  }
 
-    logger.title("Plan d'implémentation");
-    logger.info(plan.summary);
-    for (const step of plan.steps) {
-      logger.info(`  ${step.id}. ${step.description}  [${step.files.join(", ")}]`);
+  setGlmClient(client: GLMClient): void {
+    this.glm = client;
+    this.glmAvailable = true;
+    this.send({ type: "agent:status", agent: "glm", status: "available" });
+  }
+
+  setOllamaClient(client: OllamaClient | undefined): void {
+    this.ollama = client;
+    this.ollamaAvailable = Boolean(client);
+    this.send({ type: "agent:status", agent: "ollama", status: client ? "available" : "not-configured" });
+  }
+
+  async run(options: RunOptions, hooks?: OrchestratorHooks): Promise<void> {
+    const mode: RunMode = options.mode ?? "auto";
+    if (mode === "manual" && !hooks?.confirmStep) {
+      throw new Error("Le mode manuel nécessite une confirmation utilisateur (hooks.confirmStep manquant).");
     }
 
+    this.send({ type: "run:start", task: options.task, mode });
+    this.send({
+      type: "agent:status",
+      agent: "claude",
+      status: this.claudeAvailable ? "available" : "unavailable",
+    });
+    this.send({ type: "agent:status", agent: "glm", status: this.glmAvailable ? "available" : "unavailable" });
+    this.send({
+      type: "agent:status",
+      agent: "ollama",
+      status: !this.ollama ? "not-configured" : this.ollamaAvailable ? "available" : "unavailable",
+    });
+
+    const context = await this.buildContext(options);
+    const plan = await this.generatePlan(options.task, context);
+
+    this.send({ type: "plan:generated", summary: plan.summary, steps: plan.steps });
+
     if (plan.steps.length === 0) {
-      logger.warn("Le plan ne contient aucune étape. Rien à faire.");
+      this.send({ type: "plan:empty" });
+      return;
+    }
+
+    if (mode === "plan") {
+      this.send({ type: "plan:stopped" });
       return;
     }
 
@@ -79,8 +142,19 @@ export class Orchestrator {
     let totalUnreviewed = 0;
     let totalLocal = 0;
 
-    for (const step of plan.steps) {
-      logger.title(`Étape ${step.id}/${plan.steps.length} — ${step.description}`);
+    for (const [i, step] of plan.steps.entries()) {
+      const index = i + 1;
+      const total = plan.steps.length;
+      this.send({ type: "step:start", stepId: step.id, index, total, description: step.description, files: step.files });
+
+      if (mode === "manual") {
+        this.send({ type: "step:awaiting-confirmation", stepId: step.id, index, total });
+        const proceed = await hooks!.confirmStep({ step, index, total });
+        if (!proceed) {
+          this.send({ type: "run:aborted", atStep: step.id });
+          return;
+        }
+      }
 
       const baseline = await this.readBaseline(options.root, step.files);
       const outcome = await this.implementStepWithReview(step, baseline, options);
@@ -97,26 +171,28 @@ export class Orchestrator {
       if (outcome.reviewSkipped) totalUnreviewed += 1;
       if (outcome.localUsed) totalLocal += 1;
 
-      logger.success(
-        options.dryRun
-          ? `Étape ${step.id} : ${outcome.changes.length} fichier(s) proposé(s) (mode dry-run, rien écrit sur disque).`
-          : `Étape ${step.id} : ${outcome.changes.length} fichier(s) appliqué(s).`,
-      );
+      this.send({
+        type: "step:complete",
+        stepId: step.id,
+        index,
+        total,
+        changesCount: outcome.changes.length,
+        dryRun: options.dryRun,
+      });
     }
 
     if (options.testCommand && !options.dryRun) {
       await this.runTests(options);
     }
 
-    logger.title("Résumé");
-    const notes: string[] = [];
-    if (totalForced > 0) notes.push(`${totalForced} étape(s) appliquée(s) malgré des réserves (limite d'itérations atteinte)`);
-    if (totalUnreviewed > 0) notes.push(`${totalUnreviewed} étape(s) appliquée(s) sans relecture indépendante (Claude indisponible)`);
-    if (totalLocal > 0) notes.push(`${totalLocal} étape(s) implémentée(s) localement (Ollama)`);
-    logger.success(
-      `${plan.steps.length} étape(s) traitée(s), ${totalApplied} fichier(s) touché(s)` +
-        (notes.length > 0 ? `, dont ${notes.join(", ")}.` : "."),
-    );
+    this.send({
+      type: "run:summary",
+      totalSteps: plan.steps.length,
+      totalApplied,
+      totalForced,
+      totalUnreviewed,
+      totalLocal,
+    });
   }
 
   /**
@@ -126,41 +202,48 @@ export class Orchestrator {
    */
   private async generatePlan(task: string, context: ProjectContext): Promise<ImplementationPlan> {
     if (this.claudeAvailable) {
-      const spinner = logger.spinner("claude", "Analyse du projet et génération du plan d'implémentation...");
+      this.send({ type: "agent:activity", actor: "claude", phase: "plan", state: "start", text: "Analyse du projet et génération du plan d'implémentation..." });
       try {
         const plan = await this.claude.createPlan(task, context);
-        spinner.succeed("Plan généré par Claude.");
+        this.send({ type: "agent:activity", actor: "claude", phase: "plan", state: "success", text: "Plan généré par Claude." });
         return plan;
       } catch (err) {
         if (!isQuotaExhaustedError(err)) {
-          spinner.fail("Échec de la génération du plan.");
+          this.send({ type: "agent:activity", actor: "claude", phase: "plan", state: "error", text: "Échec de la génération du plan." });
           throw err;
         }
         this.claudeAvailable = false;
-        spinner.warn("Claude indisponible (crédits/quota épuisés) — bascule sur GLM pour le plan et la suite du run.");
-        logger.warn("Aucune relecture indépendante ne sera possible tant que Claude reste indisponible.");
+        this.send({ type: "agent:status", agent: "claude", status: "unavailable", reason: "quota" });
+        this.send({
+          type: "agent:activity",
+          actor: "claude",
+          phase: "plan",
+          state: "warn",
+          text: "Claude indisponible (crédits/quota épuisés) — bascule sur GLM pour le plan et la suite du run. Aucune relecture indépendante ne sera possible tant que Claude reste indisponible.",
+        });
       }
     }
 
     if (this.glmAvailable) {
-      const spinner = logger.spinner("glm", "Génération du plan d'implémentation (Claude indisponible)...");
+      this.send({ type: "agent:activity", actor: "glm", phase: "plan", state: "start", text: "Génération du plan d'implémentation (Claude indisponible)..." });
       try {
         const plan = await this.glm.createPlan(task, context);
-        spinner.succeed("Plan généré par GLM.");
+        this.send({ type: "agent:activity", actor: "glm", phase: "plan", state: "success", text: "Plan généré par GLM." });
         return plan;
       } catch (err) {
         if (!isQuotaExhaustedError(err)) {
-          spinner.fail("Échec de la génération du plan.");
+          this.send({ type: "agent:activity", actor: "glm", phase: "plan", state: "error", text: "Échec de la génération du plan." });
           throw err;
         }
         this.glmAvailable = false;
-        spinner.fail("GLM également indisponible (crédits/quota épuisés).");
+        this.send({ type: "agent:status", agent: "glm", status: "unavailable", reason: "quota" });
+        this.send({ type: "agent:activity", actor: "glm", phase: "plan", state: "error", text: "GLM également indisponible (crédits/quota épuisés)." });
       }
     }
 
-    throw new Error(
-      "Impossible de générer un plan : Claude et GLM sont tous les deux indisponibles (crédits/quota épuisés).",
-    );
+    const message = "Impossible de générer un plan : Claude et GLM sont tous les deux indisponibles (crédits/quota épuisés).";
+    this.send({ type: "run:error", message });
+    throw new Error(message);
   }
 
   /**
@@ -184,46 +267,72 @@ export class Orchestrator {
       if (agent === "local") localUsed = true;
 
       const diffs = changes.map((c) => computeFileDiff(c.path, baseline.get(c.path) ?? null, c.content));
-      for (const diff of diffs) {
-        logger.info(`--- diff: ${diff.path} ---`);
-        logger.diff(diff.unified);
-      }
+      this.send({ type: "step:diff", stepId: step.id, iteration, diffs });
 
       if (!this.claudeAvailable) {
-        logger.warn("Étape appliquée sans relecture indépendante (Claude indisponible).");
+        this.send({ type: "step:review-skipped", stepId: step.id, reason: "claude-unavailable" });
         return { changes, forcedByIterationLimit: false, reviewSkipped: true, localUsed };
       }
 
-      const reviewSpinner = logger.spinner("claude", "Relecture du code...");
+      this.send({ type: "agent:activity", actor: "claude", phase: "review", state: "start", text: "Relecture du code..." });
       let review;
       try {
         review = await this.claude.reviewChanges(step.description, step.instructions, diffs);
       } catch (err) {
         if (!isQuotaExhaustedError(err)) {
-          reviewSpinner.fail("Échec de la relecture.");
+          this.send({ type: "agent:activity", actor: "claude", phase: "review", state: "error", text: "Échec de la relecture." });
           throw err;
         }
         this.claudeAvailable = false;
-        reviewSpinner.warn("Claude devenu indisponible (crédits/quota épuisés) pendant la relecture.");
-        logger.warn("Étape appliquée sans relecture indépendante (Claude indisponible).");
+        this.send({ type: "agent:status", agent: "claude", status: "unavailable", reason: "quota" });
+        this.send({
+          type: "agent:activity",
+          actor: "claude",
+          phase: "review",
+          state: "warn",
+          text: "Claude devenu indisponible (crédits/quota épuisés) pendant la relecture.",
+        });
+        this.send({ type: "step:review-skipped", stepId: step.id, reason: "claude-unavailable" });
         return { changes, forcedByIterationLimit: false, reviewSkipped: true, localUsed };
       }
 
       if (review.verdict === "approve") {
-        reviewSpinner.succeed(`Approuvé — ${review.summary}`);
+        this.send({
+          type: "agent:activity",
+          actor: "claude",
+          phase: "review",
+          state: "success",
+          text: `Approuvé — ${review.summary}`,
+        });
+        this.send({
+          type: "step:review-result",
+          stepId: step.id,
+          iteration,
+          verdict: "approve",
+          summary: review.summary,
+          issues: review.issues,
+        });
         return { changes, forcedByIterationLimit: false, reviewSkipped: false, localUsed };
       }
 
-      reviewSpinner.warn(`Changements demandés — ${review.summary}`);
-      for (const issue of review.issues) {
-        logger.warn(`  [${issue.file}] ${issue.comment}`);
-      }
+      this.send({
+        type: "agent:activity",
+        actor: "claude",
+        phase: "review",
+        state: "warn",
+        text: `Changements demandés — ${review.summary}`,
+      });
+      this.send({
+        type: "step:review-result",
+        stepId: step.id,
+        iteration,
+        verdict: "request_changes",
+        summary: review.summary,
+        issues: review.issues,
+      });
 
       if (iteration >= options.maxIterations) {
-        logger.warn(
-          `Nombre maximal d'itérations (${options.maxIterations}) atteint pour cette étape : ` +
-            "application des dernières modifications malgré les réserves ci-dessus.",
-        );
+        this.send({ type: "step:forced", stepId: step.id, maxIterations: options.maxIterations });
         return { changes: lastChanges, forcedByIterationLimit: true, reviewSkipped: false, localUsed };
       }
 
@@ -253,52 +362,67 @@ export class Orchestrator {
     const label = iteration === 1 ? "Implémentation..." : `Implémentation (correction ${iteration - 1})...`;
 
     if (this.ollama && this.ollamaAvailable && step.complexity === "trivial") {
-      const spinner = logger.spinner("local", `${label} (étape triviale)`);
+      this.send({ type: "agent:activity", actor: "ollama", phase: "implement", state: "start", text: `${label} (étape triviale)` });
       try {
         const changes = await this.ollama.implementStep(step, currentFiles, feedback);
-        spinner.succeed("Code généré localement (Ollama).");
+        this.send({ type: "agent:activity", actor: "ollama", phase: "implement", state: "success", text: "Code généré localement (Ollama)." });
         return { changes, agent: "local" };
       } catch (err) {
         this.ollamaAvailable = false;
-        spinner.warn(`Agent local en échec (${(err as Error).message}) — repli sur GLM pour le reste du run.`);
+        this.send({ type: "agent:status", agent: "ollama", status: "unavailable", reason: "runtime-error" });
+        this.send({
+          type: "agent:activity",
+          actor: "ollama",
+          phase: "implement",
+          state: "warn",
+          text: `Agent local en échec (${(err as Error).message}) — repli sur GLM pour le reste du run.`,
+        });
       }
     }
 
     if (this.glmAvailable) {
-      const spinner = logger.spinner("glm", label);
+      this.send({ type: "agent:activity", actor: "glm", phase: "implement", state: "start", text: label });
       try {
         const changes = await this.glm.implementStep(step, currentFiles, feedback);
-        spinner.succeed("Code généré par GLM.");
+        this.send({ type: "agent:activity", actor: "glm", phase: "implement", state: "success", text: "Code généré par GLM." });
         return { changes, agent: "glm" };
       } catch (err) {
         if (!isQuotaExhaustedError(err)) {
-          spinner.fail("Échec de l'implémentation.");
+          this.send({ type: "agent:activity", actor: "glm", phase: "implement", state: "error", text: "Échec de l'implémentation." });
           throw err;
         }
         this.glmAvailable = false;
-        spinner.warn("GLM indisponible (crédits/quota épuisés) — Claude implémente directement cette étape.");
+        this.send({ type: "agent:status", agent: "glm", status: "unavailable", reason: "quota" });
+        this.send({
+          type: "agent:activity",
+          actor: "glm",
+          phase: "implement",
+          state: "warn",
+          text: "GLM indisponible (crédits/quota épuisés) — Claude implémente directement cette étape.",
+        });
       }
     }
 
     if (this.claudeAvailable) {
-      const spinner = logger.spinner("claude", `${label} (GLM indisponible)`);
+      this.send({ type: "agent:activity", actor: "claude", phase: "implement", state: "start", text: `${label} (GLM indisponible)` });
       try {
         const changes = await this.claude.implementStep(step, currentFiles, feedback);
-        spinner.succeed("Code généré par Claude.");
+        this.send({ type: "agent:activity", actor: "claude", phase: "implement", state: "success", text: "Code généré par Claude." });
         return { changes, agent: "claude" };
       } catch (err) {
         if (!isQuotaExhaustedError(err)) {
-          spinner.fail("Échec de l'implémentation.");
+          this.send({ type: "agent:activity", actor: "claude", phase: "implement", state: "error", text: "Échec de l'implémentation." });
           throw err;
         }
         this.claudeAvailable = false;
-        spinner.fail("Claude également indisponible (crédits/quota épuisés).");
+        this.send({ type: "agent:status", agent: "claude", status: "unavailable", reason: "quota" });
+        this.send({ type: "agent:activity", actor: "claude", phase: "implement", state: "error", text: "Claude également indisponible (crédits/quota épuisés)." });
       }
     }
 
-    throw new Error(
-      "Impossible d'implémenter cette étape : Claude et GLM sont tous les deux indisponibles (crédits/quota épuisés).",
-    );
+    const message = "Impossible d'implémenter cette étape : Claude et GLM sont tous les deux indisponibles (crédits/quota épuisés).";
+    this.send({ type: "run:error", message });
+    throw new Error(message);
   }
 
   private async readBaseline(root: string, files: string[]): Promise<Map<string, string | null>> {
@@ -330,15 +454,26 @@ export class Orchestrator {
   }
 
   private async runTests(options: RunOptions): Promise<void> {
-    const spinner = logger.spinner("system", `Exécution des tests : ${options.testCommand}`);
+    this.send({ type: "agent:activity", actor: "system", phase: "test", state: "start", text: `Exécution des tests : ${options.testCommand}` });
     const result = await runCommand(options.testCommand as string, options.root);
 
-    if (result.exitCode === 0) {
-      spinner.succeed("Tests OK.");
-    } else {
-      spinner.fail(`Tests en échec (code ${result.exitCode ?? "inconnu"}${result.timedOut ? ", timeout" : ""}).`);
-      logger.info(result.stdout);
-      if (result.stderr) logger.info(result.stderr);
-    }
+    this.send({
+      type: "agent:activity",
+      actor: "system",
+      phase: "test",
+      state: result.exitCode === 0 ? "success" : "error",
+      text:
+        result.exitCode === 0
+          ? "Tests OK."
+          : `Tests en échec (code ${result.exitCode ?? "inconnu"}${result.timedOut ? ", timeout" : ""}).`,
+    });
+    this.send({
+      type: "tests:result",
+      command: options.testCommand as string,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    });
   }
 }
